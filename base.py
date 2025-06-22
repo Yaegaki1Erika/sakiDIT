@@ -11,7 +11,7 @@ from model.pipeline import BaseImageToVideoPipeline
 from model.scheduler import BaseDPMScheduler
 from model.transformer import BaseTransformer3DModel
 from model.vae import AutoencoderKLBase
-
+# from torchao.quantization import autoquant
 
 def load_video(video_path: str, new_fps: int = 8):
     cap = cv2.VideoCapture(video_path)
@@ -142,6 +142,8 @@ def i2v():
         torch_dtype=dtype,
         subfolder="transformer",
     )
+    # transformer = torch.load("transformer_quantized_full.pt", weights_only=False)
+
     transformer.eval()
 
     scheduler = BaseDPMScheduler(
@@ -159,11 +161,19 @@ def i2v():
         transformer=transformer,
         scheduler=scheduler,
     )
+    
     prompt = ""
     pipe.vae.enable_tiling()
     pipe.to(dtype=dtype, device=device)
+    # pipe.vae.to(dtype=dtype,device=device)
+    # pipe.text_encoder.to(dtype=dtype, device=device)
+    # pipe.transformer = autoquant(pipe.transformer, error_on_unseen=False)
+    # torch.save(transformer.state_dict(), "transformer_quantized.pth")
+    # torch.save(pipe.transformer, "transformer_quantized_quto.pt")
+
 
     for i, (stem, da) in enumerate(data):
+        # da=da.to(dtype=dtype, device=device)
         video = pipe(
             pose_video=da,
             height=image_size[0],
@@ -179,6 +189,9 @@ def i2v():
             generator=generator,
             use_dynamic_cfg=True,
         ).frames[0]
+        # if not saved:
+        #     # 一次性保存结构和权重
+        #     torch.save(pipe.transformer, "transformer_quantized_full.pt")
 
         export_to_video(video, (output_dir / f'{stem}.mp4').as_posix(), fps=8)
 

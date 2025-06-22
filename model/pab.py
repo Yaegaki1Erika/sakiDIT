@@ -8,8 +8,11 @@ class PABConfig:
         cross_threshold: list = None,
         cross_range: int = None,
         spatial_broadcast: bool = False,
+        mlp_broadcast_test: bool = False,
         spatial_threshold: list = None,
+        mlp_test_threshold: list = None,
         spatial_range: int = None,
+        mlp_test_range: int = None,
         temporal_broadcast: bool = False,
         temporal_threshold: list = None,
         temporal_range: int = None,
@@ -24,8 +27,11 @@ class PABConfig:
         self.cross_range = cross_range
 
         self.spatial_broadcast = spatial_broadcast
+        self.mlp_broadcast_test = mlp_broadcast_test
         self.spatial_threshold = spatial_threshold
+        self.mlp_test_threshold = mlp_test_threshold
         self.spatial_range = spatial_range
+        self.mlp_test_range = mlp_test_range
 
         self.temporal_broadcast = temporal_broadcast
         self.temporal_threshold = temporal_threshold
@@ -80,6 +86,19 @@ class PABManager:
             and (timestep is not None)
             and (count % self.config.spatial_range != 0)
             and (self.config.spatial_threshold[0] < timestep < self.config.spatial_threshold[1])
+        ):
+            flag = True
+        else:
+            flag = False
+        count = (count + 1) % self.config.steps
+        return flag, count
+    
+    def if_broadcast_mlp_test(self, timestep: int, count: int):
+        if (
+            self.config.mlp_broadcast_test
+            and (timestep is not None)
+            and (count % self.config.mlp_test_range != 0)
+            and (self.config.mlp_test_threshold[0] < timestep < self.config.mlp_test_threshold[1])
         ):
             flag = True
         else:
@@ -214,6 +233,10 @@ def if_broadcast_spatial(timestep: int, count: int):
         return False, count
     return PAB_MANAGER.if_broadcast_spatial(timestep, count)
 
+def if_broadcast_mlp_test(timestep: int, count: int):
+    if not enable_pab():
+        return False, count
+    return PAB_MANAGER.if_broadcast_mlp_test(timestep, count)
 
 def if_broadcast_mlp(timestep: int, count: int, block_idx: int, all_timesteps, is_temporal=False):
     if not enable_pab():
@@ -236,11 +259,17 @@ class CogVideoXPABConfig(PABConfig):
         spatial_broadcast: bool = True,
         spatial_threshold: list = [0, 1000],
         spatial_range: int = 30,
+        mlp_test_threshold: list = [100, 900],
+        mlp_broadcast_test: bool = True,
+        mlp_test_range: int = 10,
     ):
         super().__init__(
             spatial_broadcast=spatial_broadcast,
             spatial_threshold=spatial_threshold,
             spatial_range=spatial_range,
+            mlp_broadcast_test=mlp_broadcast_test,
+            mlp_test_threshold=mlp_test_threshold,
+            mlp_test_range=mlp_test_range,
         )
 
 

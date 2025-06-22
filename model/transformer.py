@@ -14,7 +14,7 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import AdaLayerNorm
 from .attn_processor import BaseAttnProcessor
 
-from .pab import enable_pab, if_broadcast_spatial
+from .pab import enable_pab, if_broadcast_spatial,if_broadcast_mlp_test
 
 sort_attn=0
 attn_hidden_states_global=[None]*37
@@ -23,6 +23,18 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 def print_tensor_info(name, tensor):
     print(f"{name}: shape={tensor.shape}, mean={tensor.mean():.4f}, std={tensor.std():.4f}, min={tensor.min():.4f}, max={tensor.max():.4f}")
+
+
+def quantize_tensor_dynamic(tensor):
+    min_val = tensor.min()
+    max_val = tensor.max()
+    scale = 255.0 / (max_val - min_val + 1e-5)
+    qtensor = ((tensor - min_val) * scale).round().clamp(0, 255).to(torch.uint8)
+    return qtensor, min_val, scale
+
+def dequantize_tensor_dynamic(qtensor, min_val, scale):
+    return (qtensor.to(torch.float16) / scale) + min_val
+
 
 class BaseLayerNormZero(nn.Module):
     def __init__(
@@ -218,8 +230,10 @@ class BaseBlock(nn.Module):
         )
         # pab
         self.attn_count = 0
+        self.mlp_count = 0
         self.last_attn = None
         self.block_idx = block_idx
+        self.mlp=None
 
     def forward(
             self,
@@ -231,7 +245,7 @@ class BaseBlock(nn.Module):
             attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         # print(self.block_idx)
-        global attn_hidden_states_global,attn_encoder_hidden_states_global
+        # global attn_hidden_states_global,attn_encoder_hidden_states_global
         text_seq_length = encoder_hidden_states.size(1)
         attention_kwargs = attention_kwargs or {}
 
@@ -245,11 +259,14 @@ class BaseBlock(nn.Module):
             broadcast_attn, self.attn_count = if_broadcast_spatial(int(timestep[0]), self.attn_count)
         if enable_pab() and broadcast_attn and self.block_idx<37:
             #print("saki!!!")
-            attn_hidden_states = attn_hidden_states_global[self.block_idx]
-            attn_encoder_hidden_states = attn_encoder_hidden_states_global[self.block_idx]
+            # attn_hidden_states = attn_hidden_states_global[self.block_idx]
+            # attn_encoder_hidden_states = attn_encoder_hidden_states_global[self.block_idx]
             # attn_hidden_states_global[self.block_idx] = None
             # attn_encoder_hidden_states_global[self.block_idx] = None
-            #attn_hidden_states, attn_encoder_hidden_states = self.last_attn
+            # attn_hidden_states, attn_encoder_hidden_states = self.last_attn
+            attn_hidden_states, attn_encoder_hidden_states = [
+            dequantize_tensor_dynamic(*item) for item in self.last_attn
+            ]
         else:
             attn_hidden_states, attn_encoder_hidden_states = self.attn1(
                 hidden_states=norm_hidden_states,
@@ -258,9 +275,10 @@ class BaseBlock(nn.Module):
                 **attention_kwargs,
             )
             if enable_pab() and self.block_idx<37:
+                self.last_attn = tuple(quantize_tensor_dynamic(t) for t in (attn_hidden_states, attn_encoder_hidden_states))
                 # self.last_attn = (attn_hidden_states, attn_encoder_hidden_states)
-                attn_hidden_states_global[self.block_idx] = attn_hidden_states
-                attn_encoder_hidden_states_global[self.block_idx] = attn_encoder_hidden_states
+                # attn_hidden_states_global[self.block_idx] = attn_hidden_states
+                # attn_encoder_hidden_states_global[self.block_idx] = attn_encoder_hidden_states
 
 
         # attn_hidden_states, attn_encoder_hidden_states = self.attn1(
@@ -269,9 +287,6 @@ class BaseBlock(nn.Module):
         #     image_rotary_emb=image_rotary_emb,
             
         # )
-
-
-
         hidden_states = hidden_states + gate_msa * attn_hidden_states
         encoder_hidden_states = encoder_hidden_states + enc_gate_msa * attn_encoder_hidden_states
 
@@ -280,9 +295,18 @@ class BaseBlock(nn.Module):
             hidden_states, encoder_hidden_states, temb
         )
 
-        # feed-forward
-        norm_hidden_states = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1)
-        ff_output = self.ff(norm_hidden_states)
+
+        if enable_pab():
+            broadcast_mlp, self.mlp_count = if_broadcast_mlp_test(int(timestep[0]), self.mlp_count)
+        if enable_pab() and broadcast_mlp and self.block_idx<28:
+            ff_output = dequantize_tensor_dynamic(*self.mlp)
+        else:
+
+            # feed-forward
+            norm_hidden_states = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1)
+            ff_output = self.ff(norm_hidden_states)
+            if enable_pab() and self.block_idx<28:
+                self.mlp = quantize_tensor_dynamic(ff_output)
 
         hidden_states = hidden_states + gate_ff * ff_output[:, text_seq_length:]
         encoder_hidden_states = encoder_hidden_states + enc_gate_ff * ff_output[:, :text_seq_length]
