@@ -11,6 +11,7 @@ from model.pipeline import BaseImageToVideoPipeline
 from model.scheduler import BaseDPMScheduler
 from model.transformer import BaseTransformer3DModel
 from model.vae import AutoencoderKLBase
+import torch.cuda.nvtx as nvtx
 # from torchao.quantization import autoquant
 
 def load_video(video_path: str, new_fps: int = 8):
@@ -171,7 +172,7 @@ def i2v():
     # torch.save(transformer.state_dict(), "transformer_quantized.pth")
     # torch.save(pipe.transformer, "transformer_quantized_quto.pt")
 
-
+    target_i=0
     for i, (stem, da) in enumerate(data):
         # da=da.to(dtype=dtype, device=device)
         video = pipe(

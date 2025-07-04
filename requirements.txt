@@ -16,3 +16,4 @@ regex
 timm
 decord
 einops
+./sageattention-2.1.1-cp312-cp312-linux_x86_64.whl
