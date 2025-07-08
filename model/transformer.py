@@ -15,7 +15,10 @@ from diffusers.models.normalization import AdaLayerNorm
 from .attn_processor import BaseAttnProcessor
 
 from .pab import enable_pab, if_broadcast_spatial,if_broadcast_mlp_test
+from .teacache import get_should_calc
 
+accumulated_rel_l1_distance=0
+accumulated_rel_l1_distance=None
 sort_attn=0
 attn_hidden_states_global=[None]*37
 attn_encoder_hidden_states_global=[None]*37
@@ -405,8 +408,10 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         output_dim = patch_size * patch_size * out_channels
         self.proj_out = nn.Linear(inner_dim, output_dim)
-
         self.gradient_checkpointing = False
+        
+        # self.previous_residual = None
+        # self.previous_residual_encoder = None
 
     @property
     def attn_processors(self) -> Dict[str, BaseAttnProcessor]:
@@ -448,6 +453,7 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         for name, module in self.named_children():
             fn_recursive_attn_processor(name, module, processor)
 
+
     def forward(
             self,
             hidden_states: torch.Tensor,
@@ -461,7 +467,11 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             delta_cache_start: int = 0, # 要通过 cache skip 的第一个 block
             delta_cache_end: int = 4,   # 要通过 cache skip 的最后一个 block
             cache = None,
+            cnt = 0,
+
     ):
+        global accumulated_rel_l1_distance
+        global previous_modulated_input
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
             lora_scale = attention_kwargs.pop("scale", 1.0)
@@ -476,7 +486,7 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 logger.warning(
                     "Passing `scale` via `attention_kwargs` when not using the PEFT backend is ineffective."
                 )
-
+        
         batch_size, num_frames, channels, height, width = hidden_states.shape
 
         # 1. Time embedding
@@ -492,49 +502,85 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         # 2. Patch embedding
         hidden_states = self.patch_embed(encoder_hidden_states, hidden_states)
         hidden_states = self.embedding_dropout(hidden_states)
-
+        
         text_seq_length = encoder_hidden_states.shape[1]
         encoder_hidden_states = hidden_states[:, :text_seq_length]
         hidden_states = hidden_states[:, text_seq_length:]
-
-        # 3. Transformer blocks
-        for i, block in enumerate(self.transformer_blocks):
-            block = self.transformer_blocks[i]
-            
-            if i == delta_cache_start and delta_cache_flag == 1:
-                hidden_states_before = hidden_states
-                encoder_hidden_states_before = encoder_hidden_states
-                
-            if i == delta_cache_start and delta_cache_flag == 2:
-                hidden_states += cache["hidden_states"]
-                encoder_hidden_states += cache["encoder_hidden_states"]
-                i = delta_cache_end + 1
-                break
-
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                hidden_states, encoder_hidden_states = self._gradient_checkpointing_func(
-                    block,
-                    hidden_states,
-                    encoder_hidden_states,
-                    emb,
-                    image_rotary_emb,
-                    attention_kwargs,
-                )
-            else:
+        # should_calc=True
+        if cnt == 0 or cnt == 29:
+            should_calc=True
+            accumulated_rel_l1_distance = 0
+        else:
+            accumulated_rel_l1_distance,should_calc=get_should_calc(cnt,accumulated_rel_l1_distance,emb,previous_modulated_input)
+            if should_calc ==True:
+                accumulated_rel_l1_distance=0
+        
+        previous_modulated_input = emb
+        
+        if True and should_calc:
+            ori_hidden_states=hidden_states
+            ori_encoder_hidden_states=encoder_hidden_states
+            # ori_hidden_states = hidden_states.clone()
+            # ori_encoder_hidden_states = encoder_hidden_states.clone()
+        if True and not should_calc:
+            for i, block in enumerate(self.transformer_blocks):
+                block = self.transformer_blocks[i]
                 hidden_states, encoder_hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    temb=emb,
-                    image_rotary_emb=image_rotary_emb,
-                    timestep=timesteps if enable_pab() else None,
-                    attention_kwargs=attention_kwargs,
-                )
-
-            if i == delta_cache_end and delta_cache_flag == 1:
-                cache["hidden_states"] = hidden_states - hidden_states_before
-                cache["encoder_hidden_states"] = encoder_hidden_states - encoder_hidden_states_before
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        temb=emb,
+                        image_rotary_emb=image_rotary_emb,
+                        timestep=timesteps if enable_pab() else None,
+                        attention_kwargs=attention_kwargs,
+                    )
+            # print(self.cnt)
+            # hidden_states =hidden_states
+            # encoder_hidden_states =encoder_hidden_states
+        else:
+            # 3. Transformer blocks
+            for i, block in enumerate(self.transformer_blocks):
+                block = self.transformer_blocks[i]
                 
+                if i == delta_cache_start and delta_cache_flag == 1:
+                    hidden_states_before = hidden_states
+                    encoder_hidden_states_before = encoder_hidden_states
+                    
+                if i == delta_cache_start and delta_cache_flag == 2:
+                    hidden_states += cache["hidden_states"]
+                    encoder_hidden_states += cache["encoder_hidden_states"]
+                    i = delta_cache_end + 1
+                    break
 
+                if torch.is_grad_enabled() and self.gradient_checkpointing:
+                    hidden_states, encoder_hidden_states = self._gradient_checkpointing_func(
+                        block,
+                        hidden_states,
+                        encoder_hidden_states,
+                        emb,
+                        image_rotary_emb,
+                        attention_kwargs,
+                    )
+                else:
+                    hidden_states, encoder_hidden_states = block(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        temb=emb,
+                        image_rotary_emb=image_rotary_emb,
+                        timestep=timesteps if enable_pab() else None,
+                        attention_kwargs=attention_kwargs,
+                    )
+
+                if i == delta_cache_end and delta_cache_flag == 1:
+                    cache["hidden_states"] = hidden_states - hidden_states_before
+                    cache["encoder_hidden_states"] = encoder_hidden_states - encoder_hidden_states_before
+                    # print("[DEBUG] delta_cache hidden_states norm:", cache["hidden_states"].abs().mean().item())
+                    # print("[DEBUG] delta_cache encoder_hidden_states norm:", cache["encoder_hidden_states"].abs().mean().item())
+            if True and should_calc:
+                # print("???")
+                cache["previous_residual"] = hidden_states - ori_hidden_states
+                cache["previous_residual_encoder"] = encoder_hidden_states - ori_encoder_hidden_states
+        # print_tensor_info("en",encoder_hidden_states)
+        # print_tensor_info("hi",hidden_states)
         hidden_states = self.norm_final(hidden_states)
 
         # 4. Final block
@@ -549,7 +595,7 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         if USE_PEFT_BACKEND:
             # remove `lora_scale` from each PEFT layer
             unscale_lora_layers(self, lora_scale)
-
+        
         if not return_dict:
             return (output,)
         return Transformer2DModelOutput(sample=output)
