@@ -18,11 +18,51 @@ from .pab import enable_pab, if_broadcast_spatial,if_broadcast_mlp_test
 from .teacache import get_should_calc
 
 accumulated_rel_l1_distance=0
-accumulated_rel_l1_distance=None
+previous_modulated_input=None
 sort_attn=0
 attn_hidden_states_global=[None]*37
 attn_encoder_hidden_states_global=[None]*37
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+import torch
+
+import torch
+
+def quantize_int4(tensor):
+    orig_shape = tensor.shape
+    flat = tensor.flatten()
+
+    scale = flat.abs().max() / 7.0
+    scale = max(scale, 1e-8)
+    qt = (flat / scale).round().clamp(-8, 7).to(torch.int8)
+
+    # 打包两个 int4 → uint8
+    if qt.numel() % 2 != 0:
+        qt = torch.cat([qt, torch.zeros(1, dtype=torch.int8, device=qt.device)])  # 补1个0
+
+    qt_packed = (qt[::2] & 0x0F) | ((qt[1::2] & 0x0F) << 4)
+    return qt_packed.to(torch.uint8), scale, orig_shape
+
+
+def dequantize_int4(qt_packed, scale, orig_shape):
+    total_elems = torch.prod(torch.tensor(orig_shape)).item()
+    unpacked_len = qt_packed.numel() * 2
+
+    # 解码成 int4
+    low = (qt_packed & 0x0F).to(torch.int8)
+    high = ((qt_packed >> 4) & 0x0F).to(torch.int8)
+    low[low >= 8] -= 16
+    high[high >= 8] -= 16
+
+    qt = torch.empty(unpacked_len, dtype=torch.int8, device=qt_packed.device)
+    qt[::2] = low
+    qt[1::2] = high
+
+    # 截断多余补的元素，reshape
+    qt = qt[:total_elems]
+    return (qt.to(torch.float16) * scale).reshape(orig_shape)
+
 
 def print_tensor_info(name, tensor):
     print(f"{name}: shape={tensor.shape}, mean={tensor.mean():.4f}, std={tensor.std():.4f}, min={tensor.min():.4f}, max={tensor.max():.4f}")
@@ -232,8 +272,8 @@ class BaseBlock(nn.Module):
             bias=ff_bias,
         )
         # pab
-        self.attn_count = 0
-        self.mlp_count = 0
+        # self.attn_count = 0
+        # self.mlp_count = 0
         self.last_attn = None
         self.block_idx = block_idx
         self.mlp=None
@@ -246,6 +286,8 @@ class BaseBlock(nn.Module):
             image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
             timestep=None,
             attention_kwargs: Optional[Dict[str, Any]] = None,
+            attn_count1: int = 0,
+            mlp_count1: int = 0,
     ) -> torch.Tensor:
         # print(self.block_idx)
         # global attn_hidden_states_global,attn_encoder_hidden_states_global
@@ -259,7 +301,7 @@ class BaseBlock(nn.Module):
         #print(enable_pab())
         #print("saki!!")
         if enable_pab():
-            broadcast_attn, self.attn_count = if_broadcast_spatial(int(timestep[0]), self.attn_count)
+            broadcast_attn, _ = if_broadcast_spatial(int(timestep[0]), attn_count1)
         if enable_pab() and broadcast_attn and self.block_idx<37:
             #print("saki!!!")
             # attn_hidden_states = attn_hidden_states_global[self.block_idx]
@@ -300,16 +342,24 @@ class BaseBlock(nn.Module):
 
 
         if enable_pab():
-            broadcast_mlp, self.mlp_count = if_broadcast_mlp_test(int(timestep[0]), self.mlp_count)
+            broadcast_mlp, _ = if_broadcast_mlp_test(int(timestep[0]), mlp_count1)
         if enable_pab() and broadcast_mlp and self.block_idx<28:
-            ff_output = dequantize_tensor_dynamic(*self.mlp)
+            if self.block_idx<2:
+                ff_output = dequantize_int4(*self.mlp)
+            elif self.block_idx<28:
+                ff_output = dequantize_tensor_dynamic(*self.mlp)            
         else:
 
             # feed-forward
             norm_hidden_states = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1)
             ff_output = self.ff(norm_hidden_states)
-            if enable_pab() and self.block_idx<28:
-                self.mlp = quantize_tensor_dynamic(ff_output)
+            if enable_pab():
+                if self.block_idx<2:
+                    qt_packed, scale, shape = quantize_int4(ff_output)
+                    self.mlp = (qt_packed, scale, shape)
+                elif self.block_idx<28:
+                    self.mlp = quantize_tensor_dynamic(ff_output)
+
 
         hidden_states = hidden_states + gate_ff * ff_output[:, text_seq_length:]
         encoder_hidden_states = encoder_hidden_states + enc_gate_ff * ff_output[:, :text_seq_length]
@@ -517,26 +567,18 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         
         previous_modulated_input = emb
         
-        if True and should_calc:
-            ori_hidden_states=hidden_states
-            ori_encoder_hidden_states=encoder_hidden_states
             # ori_hidden_states = hidden_states.clone()
             # ori_encoder_hidden_states = encoder_hidden_states.clone()
+        # print_tensor_info("encoder_hidden_states:before teacache",encoder_hidden_states)
+        # print_tensor_info("hidden_states:before teacache",hidden_states)
         if True and not should_calc:
-            for i, block in enumerate(self.transformer_blocks):
-                block = self.transformer_blocks[i]
-                hidden_states, encoder_hidden_states = block(
-                        hidden_states=hidden_states,
-                        encoder_hidden_states=encoder_hidden_states,
-                        temb=emb,
-                        image_rotary_emb=image_rotary_emb,
-                        timestep=timesteps if enable_pab() else None,
-                        attention_kwargs=attention_kwargs,
-                    )
-            # print(self.cnt)
-            # hidden_states =hidden_states
-            # encoder_hidden_states =encoder_hidden_states
+            # print("use cache: ",cnt)
+            hidden_states =hidden_states+ cache["previous_residual"]
+            encoder_hidden_states =encoder_hidden_states+ cache["previous_residual_encoder"]
         else:
+            if True and should_calc:
+                ori_hidden_states=hidden_states
+                ori_encoder_hidden_states=encoder_hidden_states
             # 3. Transformer blocks
             for i, block in enumerate(self.transformer_blocks):
                 block = self.transformer_blocks[i]
@@ -568,6 +610,8 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                         image_rotary_emb=image_rotary_emb,
                         timestep=timesteps if enable_pab() else None,
                         attention_kwargs=attention_kwargs,
+                        attn_count1=cnt,
+                        mlp_count1=cnt,
                     )
 
                 if i == delta_cache_end and delta_cache_flag == 1:
@@ -576,11 +620,9 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     # print("[DEBUG] delta_cache hidden_states norm:", cache["hidden_states"].abs().mean().item())
                     # print("[DEBUG] delta_cache encoder_hidden_states norm:", cache["encoder_hidden_states"].abs().mean().item())
             if True and should_calc:
-                # print("???")
                 cache["previous_residual"] = hidden_states - ori_hidden_states
                 cache["previous_residual_encoder"] = encoder_hidden_states - ori_encoder_hidden_states
-        # print_tensor_info("en",encoder_hidden_states)
-        # print_tensor_info("hi",hidden_states)
+
         hidden_states = self.norm_final(hidden_states)
 
         # 4. Final block

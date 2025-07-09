@@ -1021,8 +1021,9 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
                 timestep = t.expand(latent_model_input.shape[0])
 
                 delta_cache_flag = 1 if i % 15 == 0 else 2
-                # delta_cache_flag = 0
-
+                # delta_cache_flag = 2
+                # if i in {5,6,7,9,10,15,20,21,22,24,25}:
+                #     delta_cache_flag = 1
                 # predict noise model_output
                 noise_pred = self.transformer(
                     hidden_states=latent_model_input,
@@ -1035,6 +1036,7 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
                     delta_cache_start=28,
                     delta_cache_end=36,
                     cache=cache,
+                    cnt=i,
                 )[0]
                 noise_pred = noise_pred.float()
 

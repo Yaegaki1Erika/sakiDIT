@@ -11,9 +11,7 @@ from model.pipeline import BaseImageToVideoPipeline
 from model.scheduler import BaseDPMScheduler
 from model.transformer import BaseTransformer3DModel
 from model.vae import AutoencoderKLBase
-import torch.cuda.nvtx as nvtx
 # from torchao.quantization import autoquant
-
 def load_video(video_path: str, new_fps: int = 8):
     cap = cv2.VideoCapture(video_path)
     old_fps = int(cap.get(cv2.CAP_PROP_FPS))
