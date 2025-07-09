@@ -15,7 +15,7 @@ from diffusers.models.normalization import AdaLayerNorm
 from .attn_processor import BaseAttnProcessor
 
 from .pab import enable_pab, if_broadcast_spatial,if_broadcast_mlp_test
-from .teacache import get_should_calc
+from .teacache import get_should_calc,enable_teacache
 
 accumulated_rel_l1_distance=0
 previous_modulated_input=None
@@ -571,12 +571,12 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             # ori_encoder_hidden_states = encoder_hidden_states.clone()
         # print_tensor_info("encoder_hidden_states:before teacache",encoder_hidden_states)
         # print_tensor_info("hidden_states:before teacache",hidden_states)
-        if True and not should_calc:
+        if enable_teacache and not should_calc:
             # print("use cache: ",cnt)
             hidden_states =hidden_states+ cache["previous_residual"]
             encoder_hidden_states =encoder_hidden_states+ cache["previous_residual_encoder"]
         else:
-            if True and should_calc:
+            if enable_teacache and should_calc:
                 ori_hidden_states=hidden_states
                 ori_encoder_hidden_states=encoder_hidden_states
             # 3. Transformer blocks
@@ -619,7 +619,7 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     cache["encoder_hidden_states"] = encoder_hidden_states - encoder_hidden_states_before
                     # print("[DEBUG] delta_cache hidden_states norm:", cache["hidden_states"].abs().mean().item())
                     # print("[DEBUG] delta_cache encoder_hidden_states norm:", cache["encoder_hidden_states"].abs().mean().item())
-            if True and should_calc:
+            if enable_teacache and should_calc:
                 cache["previous_residual"] = hidden_states - ori_hidden_states
                 cache["previous_residual_encoder"] = encoder_hidden_states - ori_encoder_hidden_states
 

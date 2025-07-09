@@ -12,6 +12,9 @@ from model.scheduler import BaseDPMScheduler
 from model.transformer import BaseTransformer3DModel
 from model.vae import AutoencoderKLBase
 # from torchao.quantization import autoquant
+
+from torch import compile
+
 def load_video(video_path: str, new_fps: int = 8):
     cap = cv2.VideoCapture(video_path)
     old_fps = int(cap.get(cv2.CAP_PROP_FPS))
@@ -135,7 +138,7 @@ def i2v():
         subfolder="vae",
     )
     vae.eval()
-
+    # vae = torch.compile(vae)
     transformer = BaseTransformer3DModel.from_pretrained(
         model_dir.as_posix(),
         torch_dtype=dtype,
