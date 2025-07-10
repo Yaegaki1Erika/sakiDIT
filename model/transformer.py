@@ -343,10 +343,10 @@ class BaseBlock(nn.Module):
 
         if enable_pab():
             broadcast_mlp, _ = if_broadcast_mlp_test(int(timestep[0]), mlp_count1)
-        if enable_pab() and broadcast_mlp and self.block_idx<28:
-            if self.block_idx<2:
+        if enable_pab() and broadcast_mlp and 1<self.block_idx<28:
+            if 8<self.block_idx<8:
                 ff_output = dequantize_int4(*self.mlp)
-            elif self.block_idx<28:
+            elif 1<self.block_idx<28:
                 ff_output = dequantize_tensor_dynamic(*self.mlp)            
         else:
 
@@ -354,10 +354,10 @@ class BaseBlock(nn.Module):
             norm_hidden_states = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1)
             ff_output = self.ff(norm_hidden_states)
             if enable_pab():
-                if self.block_idx<2:
+                if 8<self.block_idx<8:
                     qt_packed, scale, shape = quantize_int4(ff_output)
                     self.mlp = (qt_packed, scale, shape)
-                elif self.block_idx<28:
+                elif 1<self.block_idx<28:
                     self.mlp = quantize_tensor_dynamic(ff_output)
 
 

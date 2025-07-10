@@ -14,6 +14,8 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDistribution
 
+# import math
+# from .conv import conv_forward
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -29,8 +31,12 @@ class BaseDownsample3D(nn.Module):
         compress_time: bool = False,
     ):
         super().__init__()
-
+        print("in_channels is",in_channels)
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
+        # conv_forward(input, weight, bias, stride, padding,
+        #                               dilation, transposed, output_padding,
+        #                               groups)
+        # self.conv = TritonConv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
         self.compress_time = compress_time
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -100,6 +106,38 @@ class BaseUpsample3D(nn.Module):
 
         return inputs
 
+# class TritonConv2d(nn.Module):
+#     def __init__(self, in_c, out_c, kernel_size, stride=1, padding=0, dilation=1):
+#         super().__init__()
+
+#         if isinstance(kernel_size, int):
+#             kernel_size = (kernel_size, kernel_size)
+#         self.stride = (stride, stride) if isinstance(stride, int) else stride
+#         self.padding = (padding, padding) if isinstance(padding, int) else padding
+#         self.dilation = (dilation, dilation) if isinstance(dilation, int) else dilation
+
+#         # 权重和 bias 只是作为“存储容器”，值会在外部 load_state_dict 时加载
+#         self.weight = nn.Parameter(torch.empty(out_c, in_c, *kernel_size), requires_grad=False)
+#         self.bias = nn.Parameter(torch.zeros(out_c), requires_grad=False)
+
+
+
+#     def forward(self, x):  # x: [B*T, C, H, W]
+
+#         out = conv_forward(
+#             x, self.weight, self.bias,
+#             stride=self.stride,
+#             padding=self.padding,
+#             dilation=self.dilation,
+#             transposed=False,
+#             output_padding=(0, 0),
+#             groups=1
+#         )
+
+#         # # 4. NHWC → NCHW
+#         # out = out.permute(0, 3, 1, 2).contiguous()  # [B*T, C_out, H, W]
+#         return out
+
 
 class BaseSafeConv3d(nn.Conv3d):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -160,13 +198,20 @@ class BaseCausalConv3d(nn.Module):
 
         stride = stride if isinstance(stride, tuple) else (stride, 1, 1)
         dilation = (dilation, 1, 1)
-        self.conv = BaseSafeConv3d(
+        self.conv = BaseSafeConv3d(   
             in_channels=in_channels,
             out_channels=out_channels,
             kernel_size=kernel_size,
             stride=stride,
             dilation=dilation,
         )
+        # self.conv = BaseSafeConv3d(
+        #     in_channels=in_channels,
+        #     out_channels=out_channels,
+        #     kernel_size=kernel_size,
+        #     stride=stride,
+        #     dilation=dilation,
+        # )
 
     def fake_context_parallel_forward(
         self, inputs: torch.Tensor, conv_cache: Optional[torch.Tensor] = None
@@ -782,6 +827,7 @@ class BaseDecoder3D(nn.Module):
         temb: Optional[torch.Tensor] = None,
         conv_cache: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
+        # print(1)
         new_conv_cache = {}
         conv_cache = conv_cache or {}
 
