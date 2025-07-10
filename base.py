@@ -5,12 +5,15 @@ import torch
 import numpy as np
 from PIL import Image
 from pathlib import Path
+from accelerate import init_empty_weights
+from safetensors.torch import load_file
 from diffusers.utils import export_to_video, load_image
 from transformers import T5EncoderModel, T5Tokenizer
 from model.pipeline import BaseImageToVideoPipeline
 from model.scheduler import BaseDPMScheduler
 from model.transformer import BaseTransformer3DModel
 from model.vae import AutoencoderKLBase
+from model.qLinearLayer import replace_linear_skeleton
 # from torchao.quantization import autoquant
 def load_video(video_path: str, new_fps: int = 8):
     cap = cv2.VideoCapture(video_path)
@@ -136,14 +139,32 @@ def i2v():
     )
     vae.eval()
 
-    transformer = BaseTransformer3DModel.from_pretrained(
-        model_dir.as_posix(),
-        torch_dtype=dtype,
-        subfolder="transformer",
-    )
-    # transformer = torch.load("transformer_quantized_full.pt", weights_only=False)
+    # transformer = BaseTransformer3DModel.from_pretrained(
+    #     model_dir.as_posix(),
+    #     torch_dtype=dtype,
+    #     subfolder="transformer",
+    # )
+    # transformer.eval()
 
-    transformer.eval()
+    ckpt = "./checkpoints/transformer_int8.safetensors/diffusion_pytorch_model.safetensors"
+
+    # 1. 零显存创建网络骨架
+    with init_empty_weights():
+        config = BaseTransformer3DModel.load_config(
+            "./checkpoints/transformer_int8.safetensors/config.json"
+        )
+        transformer  = BaseTransformer3DModel.from_config(config)
+
+    # 2. 把 nn.Linear → QuantLinear
+    for block in transformer.transformer_blocks:
+        replace_linear_skeleton(block)
+
+    # 3. 把量化权重真正 load 进来
+    state_dict = load_file(ckpt)
+    missing, unexpected = transformer.load_state_dict(state_dict, strict=False, assign=True)   # buffers 已匹配
+    assert not missing and not unexpected, f"state_dict mismatch: {missing=}, {unexpected=}"
+
+    transformer.to("cuda").eval()
 
     scheduler = BaseDPMScheduler(
         clip_sample=False,
