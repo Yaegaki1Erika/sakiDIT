@@ -5,19 +5,21 @@ import torch
 import numpy as np
 from PIL import Image
 from pathlib import Path
-from accelerate import init_empty_weights
-from safetensors.torch import load_file
+# from accelerate import init_empty_weights
+# from safetensors.torch import load_file
 from diffusers.utils import export_to_video, load_image
 from transformers import T5EncoderModel, T5Tokenizer
 from model.pipeline import BaseImageToVideoPipeline
 from model.scheduler import BaseDPMScheduler
 from model.transformer import BaseTransformer3DModel
 from model.vae import AutoencoderKLBase
-from model.qLinearLayer import replace_linear_skeleton
+import torch_tensorrt
+# from model.qLinearLayer import replace_linear_skeleton
 # from torchao.quantization import autoquant
-
-from torch import compile
-
+# torch.cuda.set_per_process_memory_fraction(40 / 96, device=0)
+# import time
+total_vedio_num=0
+vae_batch_size=4
 def load_video(video_path: str, new_fps: int = 8):
     cap = cv2.VideoCapture(video_path)
     old_fps = int(cap.get(cv2.CAP_PROP_FPS))
@@ -85,7 +87,9 @@ def i2v():
     output_dir = Path(sys.argv[3])
     model_dir = Path(sys.argv[4])
 
-    # 默认配置，不可以修改
+    # 
+    
+
     # h, w
     image_size = (720, 1280)
     base_height = 720
@@ -140,34 +144,38 @@ def i2v():
         torch_dtype=dtype,
         subfolder="vae",
     )
+    vae = torch_tensorrt.ts.convert(vae)
     vae.eval()
+    vae.save("vae_trt.pt")
+    # vae = torch.compile(vae, mode="reduce-overhead", fullgraph=False)
+    # vae=torch.compile(vae)
 
-    # transformer = BaseTransformer3DModel.from_pretrained(
-    #     model_dir.as_posix(),
-    #     torch_dtype=dtype,
-    #     subfolder="transformer",
-    # )
-    # transformer.eval()
+    transformer = BaseTransformer3DModel.from_pretrained(
+        model_dir.as_posix(),
+        torch_dtype=dtype,
+        subfolder="transformer",
+    )
+    transformer.eval()
 
-    ckpt = "./cti/diffusion_pytorch_model.safetensors"
+    # ckpt = "./cti/diffusion_pytorch_model.safetensors"
 
-    # 1. 零显存创建网络骨架
-    with init_empty_weights():
-        config = BaseTransformer3DModel.load_config(
-            "./cti/config.json"
-        )
-        transformer  = BaseTransformer3DModel.from_config(config)
+    # # 1. 零显存创建网络骨架
+    # with init_empty_weights():
+    #     config = BaseTransformer3DModel.load_config(
+    #         "./cti/config.json"
+    #     )
+    #     transformer  = BaseTransformer3DModel.from_config(config)
 
-    # 2. 把 nn.Linear → QuantLinear
-    for block in transformer.transformer_blocks:
-        replace_linear_skeleton(block)
+    # # 2. 把 nn.Linear → QuantLinear
+    # for block in transformer.transformer_blocks:
+    #     replace_linear_skeleton(block)
 
-    # 3. 把量化权重真正 load 进来
-    state_dict = load_file(ckpt)
-    missing, unexpected = transformer.load_state_dict(state_dict, strict=False, assign=True)   # buffers 已匹配
-    assert not missing and not unexpected, f"state_dict mismatch: {missing=}, {unexpected=}"
+    # # 3. 把量化权重真正 load 进来
+    # state_dict = load_file(ckpt)
+    # missing, unexpected = transformer.load_state_dict(state_dict, strict=False, assign=True)   # buffers 已匹配
+    # assert not missing and not unexpected, f"state_dict mismatch: {missing=}, {unexpected=}"
 
-    transformer.to("cuda").eval()
+    # transformer.to("cuda").eval()
 
     scheduler = BaseDPMScheduler(
         clip_sample=False,
@@ -193,11 +201,21 @@ def i2v():
     # pipe.transformer = autoquant(pipe.transformer, error_on_unseen=False)
     # torch.save(transformer.state_dict(), "transformer_quantized.pth")
     # torch.save(pipe.transformer, "transformer_quantized_quto.pt")
-
+    round_times = []
+    stem_batch = []
     target_i=0
+    global total_vedio_num,vae_batch_size
+    total_vedio_num=len(data)
+    tmp_stem=0
     for i, (stem, da) in enumerate(data):
+        stem_batch.append(stem)
+
+        # if i!=target_i:
+        #     continue
         # da=da.to(dtype=dtype, device=device)
-        video = pipe(
+        # if 1 <= i <= 4:
+        #     t0 = time.perf_counter()
+        videos = pipe(
             pose_video=da,
             height=image_size[0],
             width=image_size[1],
@@ -211,12 +229,28 @@ def i2v():
             guidance_scale=6,
             generator=generator,
             use_dynamic_cfg=True,
-        ).frames[0]
+            total_vedio_num=total_vedio_num,
+        )
         # if not saved:
         #     # 一次性保存结构和权重
         #     torch.save(pipe.transformer, "transformer_quantized_full.pt")
+        if (i!=0 and (i+1)%vae_batch_size==0) or i+1==total_vedio_num:
+            # print("saki111")
+            for video, stem in zip(videos, stem_batch):
+                # print("saki!!!")
+                stem_now=stem_batch[tmp_stem]
+                tmp_stem+=1
+                export_to_video(video[0], (output_dir / f'{stem_now}.mp4').as_posix(), fps=8)
+        # export_to_video(video, (output_dir / f'{stem}.mp4').as_posix(), fps=8)
+        # if 1 <= i <= 4:
+        #     t1 = time.perf_counter()
+        #     round_times.append(t1 - t0)
 
-        export_to_video(video, (output_dir / f'{stem}.mp4').as_posix(), fps=8)
+    # if round_times:
+    #     print(f"Rounds 2–4 total time: {sum(round_times):.2f}s")
+    #     for idx, t in enumerate(round_times, start=2):
+    #         print(f"Round {idx} time: {t:.2f}s")
+
 
 
 if __name__ == '__main__':

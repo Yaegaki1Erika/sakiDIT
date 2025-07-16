@@ -17,10 +17,19 @@ from .scheduler import BaseDPMScheduler
 from .transformer import BaseTransformer3DModel
 from .pipeline_output import BasePipelineOutput
 from .vae import AutoencoderKLBase
+# import gc
+
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
-
+# _prompt_embed_cache = {}
+negative_prompt_embeds_global = None
+prompt_embeds_global = None
+latents_list=[]
+list_vedio=0
+list_vedio_total=0
+is_del_te=0
+# latents_one=None
 # Similar to diffusers.pipelines.hunyuandit.pipeline_hunyuandit.get_resize_crop_region_for_grid
 def get_resize_crop_region_for_grid(src, tgt_width, tgt_height):
     tw = tgt_width
@@ -117,6 +126,10 @@ class BasePipeline(DiffusionPipeline):
             device: Optional[torch.device] = None,
             dtype: Optional[torch.dtype] = None,
     ):
+        # global _prompt_embed_cache,prompt_embed  # 全局声明
+
+        # if prompt_embed!=None:
+        #     return prompt_embed
         device = device or self._execution_device
         dtype = dtype or self.text_encoder.dtype
 
@@ -148,7 +161,7 @@ class BasePipeline(DiffusionPipeline):
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt, seq_len, -1)
-
+        # prompt_embed = prompt_embeds
         return prompt_embeds
 
     def encode_prompt(
@@ -490,11 +503,12 @@ class BasePipeline(DiffusionPipeline):
                 noise_pred = noise_pred.float()
 
                 # perform guidance
-                if use_dynamic_cfg:
-                    self._guidance_scale = 1 + guidance_scale * (
-                            (1 - math.cos(
-                                math.pi * ((num_inference_steps - t.item()) / num_inference_steps) ** 5.0)) / 2
-                    )
+                # if use_dynamic_cfg:
+                #     self._guidance_scale = 1 + guidance_scale * (
+                #             (1 - math.cos(
+                #                 math.pi * ((num_inference_steps - t.item()) / num_inference_steps) ** 5.0)) / 2
+                #     )
+                self._guidance_scale = 7.5
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
@@ -603,6 +617,7 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
             device: Optional[torch.device] = None,
             dtype: Optional[torch.dtype] = None,
     ):
+        
         device = device or self._execution_device
         dtype = dtype or self.text_encoder.dtype
 
@@ -634,7 +649,6 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt, seq_len, -1)
-
         return prompt_embeds
 
     def encode_prompt(
@@ -649,6 +663,11 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
             device: Optional[torch.device] = None,
             dtype: Optional[torch.dtype] = None,
     ):
+        global negative_prompt_embeds_global,prompt_embeds_global,is_del_te
+        if negative_prompt_embeds_global != None and prompt_embeds_global != None:
+            # if isinstance(module, torch.nn.Module):
+            #     module.to("cpu")
+            return negative_prompt_embeds_global, prompt_embeds_global
         device = device or self._execution_device
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
@@ -665,7 +684,7 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
                 device=device,
                 dtype=dtype,
             )
-
+            prompt_embeds_global=prompt_embeds
         if do_classifier_free_guidance and negative_prompt_embeds is None:
             negative_prompt = negative_prompt or ""
             negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
@@ -689,7 +708,19 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
                 device=device,
                 dtype=dtype,
             )
-
+            negative_prompt_embeds_global=negative_prompt_embeds
+            if is_del_te==0:
+                is_del_te=1
+                modules_to_remove = ["text_encoder"]
+                for name in modules_to_remove:
+                    if hasattr(self, name):
+                        module = getattr(self, name)
+                        # 如果模块在 cuda 上，移除前手动转回 CPU（保险做法）
+                        if isinstance(module, torch.nn.Module):
+                            module.to("cpu")
+                # gc.collect()
+                torch.cuda.empty_cache()
+                # torch.cuda.ipc_collect()
         return prompt_embeds, negative_prompt_embeds
 
     def prepare_latents(
@@ -720,6 +751,8 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
             width // self.vae_scale_factor_spatial,
         )
         pose_video = pose_video.permute(0, 2, 1, 3, 4)
+        device = torch.device('cuda:0')
+        pose_video = pose_video.to(device, dtype=torch.float16)
         pose_latent_dist = self.vae.encode(pose_video).latent_dist
         pose_latent_dist = pose_latent_dist.sample(generator) * self.vae_scaling_factor_image
         pose_latent_dist = pose_latent_dist.permute(0, 2, 1, 3, 4).contiguous()
@@ -903,6 +936,7 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
             ] = None,
             callback_on_step_end_tensor_inputs: List[str] = ["latents"],
             max_sequence_length: int = 226,
+            total_vedio_num: int=0,
     ) -> Union[BasePipelineOutput, Tuple]:
 
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
@@ -1025,6 +1059,8 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
                 # if i in {5,6,7,9,10,15,20,21,22,24,25}:
                 #     delta_cache_flag = 1
                 # predict noise model_output
+                device = torch.device('cuda:0')
+                self.transformer.to(device)
                 noise_pred = self.transformer(
                     hidden_states=latent_model_input,
                     encoder_hidden_states=prompt_embeds,
@@ -1046,6 +1082,7 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
                             (1 - math.cos(
                                 math.pi * ((num_inference_steps - t.item()) / num_inference_steps) ** 5.0)) / 2
                     )
+                # self._guidance_scale = 7.5
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
@@ -1078,19 +1115,89 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
 
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
-
+            cache = {}
         self._current_timestep = None
-
+        global list_vedio,latents_list,is_del_te,list_vedio_total
+        list_vedio_total+=1
         if not output_type == "latent":
-            video = self.decode_latents(latents)
-            video = self.video_processor.postprocess_video(video=video, output_type=output_type)
+            # video = self.decode_latents(latents)
+            # print(latents.shape)
+            # if latents_one is None:
+            #     latents_one=latents
+            # else:
+            #     latents_one = torch.cat((latents, latents_one), dim=0)
+            # latents = None
+
+
+            latents_list.append(latents.squeeze(0))
+            for i, latent in enumerate(latents_list):
+                if latent is None:
+                    print(f"[ERROR] latent at index {i} is None!")
+            if list_vedio==3 or list_vedio_total==total_vedio_num:
+                
+
+                # for obj in gc.get_objects():
+                #     try:
+                #         if torch.is_tensor(obj) and obj.device.type == 'cuda':
+                #             print(f"Still on GPU: {type(obj)}, shape={obj.shape}, dtype={obj.dtype}")
+                #     except:
+                #         pass
+                 # module = getattr(self, "transformer")
+                # MAX_TRANSFER_BYTES = 1 * 1024**3  # 6GB
+                # total_transferred = 0
+                # for name, param in module.named_parameters():
+                #     param_bytes = param.numel() * param.element_size()
+                #     if total_transferred + param_bytes > MAX_TRANSFER_BYTES:
+                #         continue
+                #     param.data = param.data.to("cpu", non_blocking=True)
+                #     total_transferred += param_bytes
+                        # if hasattr(self.config, name):
+                        #     delattr(self.config, name)
+                        # module = getattr(self, name)
+                        # delattr(self, name)
+                        # if hasattr(self, "components") and name in self.components:
+                        #     del self.components[name]
+                        # delattr(self, name)  # 从 self 中彻底删除
+                        # print(f"[卸载] 模块 '{name}' 已删除")
+
+                # 显式清理 CUDA 显存
+                # gc.collect()
+                for i, latent in enumerate(latents_list):
+                    if latent is None:
+                        print(f"[ERROR] latent at index {i} is None!")
+
+                torch.cuda.empty_cache()
+                # torch.cuda.ipc_collect()
+                # print("[清理] 显存缓存已释放")
+
+                latents = torch.stack(latents_list, dim=0)
+                latents_list=[]
+                videos = self.decode_latents(latents)
+                processed_videos = []
+                for video in videos:  # 每个: [3, F, H, W]
+                    video = video.unsqueeze(0)
+                    result = self.video_processor.postprocess_video(video=video, output_type=output_type)
+                    processed_videos.append(result)
+
+                video = processed_videos  # List of 5 videos
+                # list_vedio = 0  # reset for next batch
+            # video = self.video_processor.postprocess_video(video=video, output_type=output_type)
         else:
             video = latents
-
         # Offload all models
         self.maybe_free_model_hooks()
 
         if not return_dict:
             return (video,)
+        if list_vedio!=3 and list_vedio_total!=total_vedio_num:
+            video = latents
+        list_vedio+=1
+        list_vedio=list_vedio%4
+        return video
+        # else:
+        #     output
+        #     for i in range(5):
 
-        return BasePipelineOutput(frames=video)
+        #         BasePipelineOutput(frames=video[i])
+        #     video = torch.stack(video, dim=0)
+        # return BasePipelineOutput(frames=video)

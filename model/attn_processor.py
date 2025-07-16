@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from diffusers.utils import logging
 from diffusers.models.attention_processor import Attention
-from sageattention import sageattn
+# from sageattention import sageattn
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -84,7 +84,7 @@ class BaseAttnProcessor:
             query[:, :, text_seq_length:] = apply_rotary_emb(query[:, :, text_seq_length:], image_rotary_emb)
             if not attn.is_cross_attention:
                 key[:, :, text_seq_length:] = apply_rotary_emb(key[:, :, text_seq_length:], image_rotary_emb)
-        F.scaled_dot_product_attention = sageattn
+        # F.scaled_dot_product_attention = sageattn
         hidden_states = F.scaled_dot_product_attention(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
         )

@@ -1,6 +1,8 @@
+import heapq
 import torch
 import triton
 import triton.language as tl
+
 
 def conv_heuristics():
     configs = [
@@ -148,6 +150,527 @@ def conv_heuristics():
     }
     return triton.autotune(configs, key, prune_configs_by=prune_configs_by)
 
+
+# unpack the given idx given the order of axis of the desired 3-dim tensor
+# You could view it as the reverse of flatten the idx of 3 axis in a tensor to 1-dim idx.
+# order is the order of axes in tensor, innermost dimension outward
+# shape is the 3D tensor's shape
+def _unpack(idx, order, shape):
+    if torch.is_tensor(idx):
+        _12 = torch.div(idx, shape[order[0]], rounding_mode="trunc")
+        _0 = idx % shape[order[0]]
+        _2 = torch.div(_12, shape[order[1]], rounding_mode="trunc")
+        _1 = _12 % shape[order[1]]
+    else:
+        _12 = idx // shape[order[0]]
+        _0 = idx % shape[order[0]]
+        _2 = _12 // shape[order[1]]
+        _1 = _12 % shape[order[1]]
+    return _0, _1, _2
+
+
+def estimate_conv_time(
+    # backend, device,
+    num_warps,
+    num_stages,
+    x,
+    BATCH,
+    IN_C,
+    IN_H,
+    IN_W,
+    KERNEL_N,
+    KERNEL_H,
+    KERNEL_W,
+    OUT_H,
+    OUT_W,
+    BLOCK_M,
+    BLOCK_K,
+    BLOCK_N,
+    debug=False,
+    **kwargs,
+):
+    """return estimated running time in ms
+    = max(compute, loading) + store"""
+    import triton
+    import triton._C.libtriton.triton as _triton
+    from triton.ops.matmul_perf_model import (
+        get_dram_gbps as get_dram_gbps,
+        get_tflops as get_tflops,
+    )
+
+    backend = _triton.runtime.backend.CUDA
+    device = torch.cuda.current_device()
+    dtype = x.dtype
+    dtsize = x.element_size()
+
+    M = BATCH * OUT_H * OUT_W
+    N = KERNEL_N
+    K = KERNEL_H * KERNEL_W * IN_C
+    num_cta_m = triton.cdiv(M, BLOCK_M)
+    num_cta_n = triton.cdiv(N, BLOCK_N)
+    num_cta_k = 1
+    num_ctas = num_cta_m * num_cta_n * num_cta_k
+
+    # If the input is smaller than the block size
+    M, N = max(M, BLOCK_M), max(N, BLOCK_N)
+
+    # time to compute
+    total_ops = 2 * M * N * K / (1024 * 1024 * 1024)  # GOPS
+    tput = get_tflops(backend, device, num_ctas, num_warps, dtype)
+    compute_ms = total_ops / tput
+
+    # time to load data
+    # num_sm = _triton.runtime.num_sm(backend, device)
+    num_sm=78
+    active_cta_ratio = min(1, num_ctas / num_sm)
+    active_cta_ratio_bw1 = min(1, num_ctas /
+                               32)  # 32 active ctas are enough to saturate
+    active_cta_ratio_bw2 = max(min(1, (num_ctas - 32) / (108 - 32)),
+                               0)  # 32-108, remaining 5%
+    dram_bw = get_dram_gbps(backend, device) * (
+        active_cta_ratio_bw1 * 0.95 + active_cta_ratio_bw2 * 0.05)  # in GB/s
+    l2_bw = dram_bw * 4  # rough estimation (should be 4.7 for A100?)
+    # assume 80% of (following) loads are in L2 cache
+    load_a_dram = M * K * dtsize * (1 + 0.2 * (num_cta_n - 1))
+    load_a_l2 = M * K * dtsize * 0.8 * (num_cta_n - 1)
+    load_b_dram = N * K * dtsize * (1 + 0.2 * (num_cta_m - 1))
+    load_b_l2 = N * K * dtsize * 0.8 * (num_cta_m - 1)
+    # total
+    total_dram = (load_a_dram + load_b_dram) / (1024 * 1024)  # MB
+    total_l2 = (load_a_l2 + load_b_l2) / (1024 * 1024)
+    # loading time in ms
+    load_ms = total_dram / dram_bw + total_l2 / l2_bw
+
+    # estimate storing time
+    store_bw = dram_bw * 0.6  # :o
+    store_c_dram = M * N * dtsize / (1024 * 1024)  # MB
+    store_ms = store_c_dram / store_bw
+
+    total_time_ms = max(compute_ms, load_ms) + store_ms
+    if debug:
+        print(f"Total time: {total_time_ms}ms, compute time: {compute_ms}ms, "
+              f"loading time: {load_ms}ms, store time: {store_ms}ms, "
+              f"Activate CTAs: {active_cta_ratio*100}%")
+    return total_time_ms
+
+
+def early_config_prune(configs, named_args):
+    from triton.runtime import driver
+    # from triton.compiler.compiler import get_architecture_descriptor
+
+    device = torch.cuda.current_device()
+    cc =90
+    # BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages
+    dtsize = named_args["x"].element_size()
+    # dtype = named_args["x"].dtype
+
+    # 1. make sure we have enough smem
+    pruned_configs = []
+    for config in configs:
+        kw = config.kwargs
+        BLOCK_M, BLOCK_N, BLOCK_K, num_stages = (
+            kw["BLOCK_M"],
+            kw["BLOCK_N"],
+            kw["BLOCK_K"],
+            config.num_stages,
+        )
+        max_shared_memory = driver.utils.get_device_properties(
+            device)["max_shared_mem"]
+        required_shared_memory = (BLOCK_M +
+                                  BLOCK_N) * BLOCK_K * num_stages * dtsize
+        if required_shared_memory <= max_shared_memory:
+            pruned_configs.append(config)
+    configs = pruned_configs
+
+    # group configs by (BLOCK_M,_N,_K, num_warps)
+    configs_map = {}
+    for config in configs:
+        kw = config.kwargs
+        BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages = (
+            kw["BLOCK_M"],
+            kw["BLOCK_N"],
+            kw["BLOCK_K"],
+            config.num_warps,
+            config.num_stages,
+        )
+
+        key = (BLOCK_M, BLOCK_N, BLOCK_K, num_warps)
+        if key in configs_map:
+            configs_map[key].append((config, num_stages))
+        else:
+            configs_map[key] = [(config, num_stages)]
+
+    pruned_configs = []
+    for k, v in configs_map.items():
+        BLOCK_M, BLOCK_N, BLOCK_K, num_warps = k
+        if cc >= 80:
+            # compute cycles (only works for ampere GPUs)
+            mmas = BLOCK_M * BLOCK_N * BLOCK_K / (16 * 8 * 16)
+            mma_cycles = mmas / min(4, num_warps) * 8
+
+            ldgsts_latency = 300  # Does this matter?
+            optimal_num_stages = ldgsts_latency / mma_cycles
+
+            # nearest stages, prefer large #stages
+            nearest = heapq.nsmallest(
+                2,
+                v,
+                key=lambda x: 10 + abs(x[1] - optimal_num_stages) if
+                (x[1] - optimal_num_stages) < 0 else x[1] - optimal_num_stages,
+            )
+
+            for n in nearest:
+                pruned_configs.append(n[0])
+        else:  # Volta & Turing only supports num_stages <= 2
+            random_config = v[0][0]
+            random_config.num_stages = 2
+            pruned_configs.append(random_config)
+    return pruned_configs
+
+
+@conv_heuristics()
+@triton.jit
+def _kernel_delta_x_hwc(
+    x,
+    w,
+    bias,
+    y,
+    # stride of tensor
+    stride_xn,
+    stride_xc,
+    stride_xh,
+    stride_xw,
+    stride_wn,
+    stride_wc,
+    stride_wh,
+    stride_ww,
+    stride_yn,
+    stride_yc,
+    stride_yh,
+    stride_yw,
+    # pointer inc for x
+    delta_xh_ptr,
+    delta_xw_ptr,
+    delta_xc_ptr,
+    # Tensor dimensions
+    BATCH,
+    IN_C,
+    IN_H,
+    IN_W,
+    KERNEL_N,
+    KERNEL_H,
+    KERNEL_W,
+    OUT_H,
+    OUT_W,
+    # parameters of conv
+    stride_h,
+    stride_w,
+    padding_h,
+    padding_w,
+    dilation_h,
+    dilation_w,
+    output_padding_h,
+    output_padding_w,
+    groups,
+    # Metaparameters
+    ACC_TYPE: tl.constexpr,
+    CONV1X1_NHWC: tl.constexpr,
+    # blocks in different dimension
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    # reduction tiling parameter for matmul
+    BLOCK_K: tl.constexpr,
+    # Super-blocking for better L2 peformance
+    GROUP_H: tl.constexpr,
+    WITH_BIAS: tl.constexpr,
+):
+    """
+    each program instance computes a [BLOCK_BATCH, BLOCK_N, BLOCK_H, BLOCK_W] block of y
+    """
+    # -----------------------------------------------------------
+    # Map program ids `pid` to the block of y it should compute.
+    pid_nhw = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    # offset for output y
+    off_y_k = pid_k * BLOCK_N + tl.arange(0, BLOCK_N)
+    off_y_nhw = pid_nhw * BLOCK_M + tl.arange(0, BLOCK_M)
+    off_y_n = off_y_nhw // (OUT_H * OUT_W)
+    off_y_hw = off_y_nhw % (OUT_H * OUT_W)
+    off_y_h = off_y_hw // OUT_W + output_padding_h
+    off_y_w = off_y_hw % OUT_W + output_padding_w
+
+    # offset for the initial ptr for x
+    off_x_n = off_y_n
+    off_x_h = off_y_h * stride_h - padding_h
+    off_x_w = off_y_w * stride_w - padding_w
+    off_x_nhw = off_x_n * stride_xn + off_x_h * stride_xh + off_x_w * stride_xw
+    off_x_crs = tl.arange(0, BLOCK_K)
+
+    CRS = IN_C * KERNEL_H * KERNEL_W
+    # load inc ptr of x, upade x_ptrs
+    if not CONV1X1_NHWC:
+        delta_xh_ptrs = delta_xh_ptr + off_x_crs
+        delta_xw_ptrs = delta_xw_ptr + off_x_crs
+        delta_xc_ptrs = delta_xc_ptr + off_x_crs
+        delta_xh = tl.load(delta_xh_ptrs, mask=off_x_crs < CRS, other=0)
+        delta_xw = tl.load(delta_xw_ptrs, mask=off_x_crs < CRS, other=0)
+        delta_xc = tl.load(delta_xc_ptrs, mask=off_x_crs < CRS, other=0)
+        off_x_crs_unpacked = (delta_xh * stride_xh + delta_xw * stride_xw +
+                              delta_xc * stride_xc)
+        x_ptrs = x + off_x_nhw[:, None] + off_x_crs_unpacked[None, :]
+    else:
+        x_ptrs = x + off_x_nhw[:, None] + off_x_crs[None, :]
+        delta_xh = 0
+        delta_xw = 0
+
+    mask_x = ((off_x_n < BATCH)[:, None]
+              & (off_x_crs < CRS)[None, :]
+              & (off_x_h[:, None] + delta_xh[None, :] >= 0)
+              & (off_x_h[:, None] + delta_xh[None, :] < IN_H)
+              & (off_x_w[:, None] + delta_xw[None, :] >= 0)
+              & (off_x_w[:, None] + delta_xw[None, :] < IN_W))
+
+    # offset for the inital ptr for w
+    off_w_crs = tl.arange(0, BLOCK_K)
+    off_w_k = off_y_k
+    w_ptrs = w + off_w_crs[:, None] + off_w_k[None, :] * stride_wn
+    mask_w = (off_x_crs < CRS)[:, None] & (off_w_k < KERNEL_N)[None, :]
+
+    # ------ load x ------
+    matrix_x = tl.load(x_ptrs, mask=mask_x, other=0.0)
+    # ------ load w ------
+    matrix_w = tl.load(w_ptrs, mask=mask_w, other=0.0)
+
+    # -----------------------------------------------------------
+    # allocate accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    for crs in range(0, CRS, BLOCK_K):
+        # ------ matrix multiplication ------
+        acc += tl.dot(matrix_x, matrix_w, out_dtype=ACC_TYPE)
+        # ------ update ptrs ------
+        w_ptrs += BLOCK_K
+        # load inc ptr of x, upade x_ptrs
+        off_x_crs = crs + BLOCK_K + tl.arange(0, BLOCK_K)
+        if not CONV1X1_NHWC:
+            delta_xh_ptrs += BLOCK_K
+            delta_xw_ptrs += BLOCK_K
+            delta_xc_ptrs += BLOCK_K
+            delta_xh = tl.load(delta_xh_ptrs, mask=off_x_crs < CRS, other=0)
+            delta_xw = tl.load(delta_xw_ptrs, mask=off_x_crs < CRS, other=0)
+            delta_xc = tl.load(delta_xc_ptrs, mask=off_x_crs < CRS, other=0)
+            off_x_crs_unpacked = (delta_xh * stride_xh + delta_xw * stride_xw +
+                                  delta_xc * stride_xc)
+            x_ptrs = x + off_x_nhw[:, None] + off_x_crs_unpacked[None, :]
+        else:
+            x_ptrs += BLOCK_K
+
+        mask_x = ((off_x_n < BATCH)[:, None]
+                  & (off_x_crs < CRS)[None, :]
+                  & (off_x_h[:, None] + delta_xh[None, :] >= 0)
+                  & (off_x_h[:, None] + delta_xh[None, :] < IN_H)
+                  & (off_x_w[:, None] + delta_xw[None, :] >= 0)
+                  & (off_x_w[:, None] + delta_xw[None, :] < IN_W))
+        mask_w = (off_x_crs < CRS)[:, None] & (off_w_k < KERNEL_N)[None, :]
+        # ------ prefetch ------
+        # ------ load x ------
+        matrix_x = tl.load(x_ptrs, mask=mask_x, other=0.0)
+        # ------ load w ------
+        matrix_w = tl.load(w_ptrs, mask=mask_w, other=0.0)
+
+    if WITH_BIAS:
+        acc += tl.load(bias + off_y_k)[None, :]
+
+    acc = acc.to(y.dtype.element_ty)
+
+    # rematerialize -- this saves some registers
+    # offset for output y
+    off_y_k = pid_k * BLOCK_N + tl.arange(0, BLOCK_N)
+    off_y_nhw = pid_nhw * BLOCK_M + tl.arange(0, BLOCK_M)
+    off_y_n = off_y_nhw // (OUT_H * OUT_W)
+    off_y_hw = off_y_nhw % (OUT_H * OUT_W)
+    # consider output padding
+    off_y_h = off_y_hw // OUT_W + output_padding_h
+    off_y_w = off_y_hw % OUT_W + output_padding_w
+
+    # y ptrs in the block of [BLOCK_M, BLOCK_N]
+    y_ptrs = (y + off_y_n[:, None] * stride_yn + off_y_h[:, None] * stride_yh +
+              off_y_w[:, None] * stride_yw + off_y_k[None, :] * stride_yc)
+
+    # out-of-bounds check
+    mask_y = ((off_y_n < BATCH)[:, None]
+              & (off_y_h < OUT_H + output_padding_h)[:, None]
+              & (off_y_w < OUT_W + output_padding_w)[:, None]
+              & (off_y_k < KERNEL_N)[None, :])
+
+    tl.store(y_ptrs, acc, mask=mask_y)
+
+    return
+
+
+@conv_heuristics()
+@triton.jit
+def _kernel_delta_x(
+    x,
+    w,
+    bias,
+    y,
+    # stride of tensor
+    stride_xn,
+    stride_xc,
+    stride_xh,
+    stride_xw,
+    stride_wn,
+    stride_wc,
+    stride_wh,
+    stride_ww,
+    stride_yn,
+    stride_yc,
+    stride_yh,
+    stride_yw,
+    # pointer inc for x
+    delta_x_ptr,
+    # Tensor dimensions
+    BATCH,
+    IN_C,
+    IN_H,
+    IN_W,
+    KERNEL_N,
+    KERNEL_H,
+    KERNEL_W,
+    OUT_H,
+    OUT_W,
+    # parameters of conv
+    stride_h,
+    stride_w,
+    padding_h,
+    padding_w,
+    dilation_h,
+    dilation_w,
+    output_padding_h,
+    output_padding_w,
+    groups,
+    # Metaparameters
+    ACC_TYPE: tl.constexpr,
+    CONV1X1_NHWC: tl.constexpr,
+    # blocks in different dimension
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    # reduction tiling parameter for matmul
+    BLOCK_K: tl.constexpr,
+    # Super-blocking for better L2 peformance
+    GROUP_H: tl.constexpr,
+    WITH_BIAS: tl.constexpr,
+):
+    """
+    each program instance computes a [BLOCK_BATCH, BLOCK_N, BLOCK_H, BLOCK_W] block of y
+    """
+    # -----------------------------------------------------------
+    # Map program ids `pid` to the block of y it should compute.
+    pid_nhw = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    # offset for output y
+    off_y_k = pid_k * BLOCK_N + tl.arange(0, BLOCK_N)
+    off_y_nhw = pid_nhw * BLOCK_M + tl.arange(0, BLOCK_M)
+    off_y_n = off_y_nhw // (OUT_H * OUT_W)
+    off_y_hw = off_y_nhw % (OUT_H * OUT_W)
+    off_y_h = off_y_hw // OUT_W + output_padding_h
+    off_y_w = off_y_hw % OUT_W + output_padding_w
+
+    # offset for the initial ptr for x
+    off_x_n = off_y_n
+    off_x_h = off_y_h * stride_h - padding_h
+    off_x_w = off_y_w * stride_w - padding_w
+    off_x_nhw = off_x_n * stride_xn + off_x_h * stride_xh + off_x_w * stride_xw
+    off_x_crs = tl.arange(0, BLOCK_K)
+
+    CRS = IN_C * KERNEL_H * KERNEL_W
+    # load inc ptr of x, upade x_ptrs
+    if not CONV1X1_NHWC:
+        delta_x_ptrs = delta_x_ptr + off_x_crs
+        off_x_crs_unpacked = tl.load(delta_x_ptrs, mask=off_x_crs < CRS)
+        x_ptrs = x + off_x_nhw[:, None] + off_x_crs_unpacked[None, :]
+    else:
+        x_ptrs = x + off_x_nhw[:, None] + off_x_crs[None, :]
+
+    mask_x = ((off_x_n < BATCH)
+              & (off_x_h >= 0)
+              & (off_x_h < IN_H)
+              & (off_x_w >= 0)
+              & (off_x_w < IN_W))[:, None] & (off_x_crs < CRS)[None, :]
+
+    # offset for the inital ptr for w
+    off_w_crs = tl.arange(0, BLOCK_K)
+    off_w_k = off_y_k
+    w_ptrs = w + off_w_crs[:, None] + off_w_k[None, :] * stride_wn
+    mask_w = (off_x_crs < CRS)[:, None] & (off_w_k < KERNEL_N)[None, :]
+
+    # ------ load x ------
+    matrix_x = tl.load(x_ptrs, mask=mask_x, other=0.0)
+    # ------ load w ------
+    matrix_w = tl.load(w_ptrs, mask=mask_w, other=0.0)
+
+    # -----------------------------------------------------------
+    # allocate accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    for crs in range(0, CRS, BLOCK_K):
+        # ------ matrix multiplication ------
+        acc += tl.dot(matrix_x, matrix_w, out_dtype=ACC_TYPE)
+        # ------ update ptrs ------
+        w_ptrs += BLOCK_K
+        # load inc ptr of x, upade x_ptrs
+        if not CONV1X1_NHWC:
+            delta_x_ptrs += BLOCK_K
+            off_x_crs = crs + BLOCK_K + tl.arange(0, BLOCK_K)
+            off_x_crs_unpacked = tl.load(delta_x_ptrs,
+                                         mask=off_x_crs < CRS,
+                                         other=0)
+            x_ptrs = x + off_x_nhw[:, None] + off_x_crs_unpacked[None, :]
+        else:
+            off_x_crs = crs + BLOCK_K + tl.arange(0, BLOCK_K)
+            x_ptrs += BLOCK_K
+
+        mask_x = ((off_x_n < BATCH)
+                  & (off_x_h >= 0)
+                  & (off_x_h < IN_H)
+                  & (off_x_w >= 0)
+                  & (off_x_w < IN_W))[:, None] & (off_x_crs < CRS)[None, :]
+        mask_w = (off_x_crs < CRS)[:, None] & (off_w_k < KERNEL_N)[None, :]
+        # ------ prefetch ------
+        # ------ load x ------
+        matrix_x = tl.load(x_ptrs, mask=mask_x, other=0.0)
+        # ------ load w ------
+        matrix_w = tl.load(w_ptrs, mask=mask_w, other=0.0)
+
+    if WITH_BIAS:
+        acc += tl.load(bias + off_y_k)[None, :]
+
+    acc = acc.to(y.dtype.element_ty)
+
+    # rematerialize -- this saves some registers
+    # offset for output y
+    off_y_k = pid_k * BLOCK_N + tl.arange(0, BLOCK_N)
+    off_y_nhw = pid_nhw * BLOCK_M + tl.arange(0, BLOCK_M)
+    off_y_n = off_y_nhw // (OUT_H * OUT_W)
+    off_y_hw = off_y_nhw % (OUT_H * OUT_W)
+    # consider output padding
+    off_y_h = off_y_hw // OUT_W + output_padding_h
+    off_y_w = off_y_hw % OUT_W + output_padding_w
+
+    # y ptrs in the block of [BLOCK_M, BLOCK_N]
+    y_ptrs = (y + off_y_n[:, None] * stride_yn + off_y_h[:, None] * stride_yh +
+              off_y_w[:, None] * stride_yw + off_y_k[None, :] * stride_yc)
+
+    # out-of-bounds check
+    mask_y = ((off_y_n < BATCH)[:, None]
+              & (off_y_h < OUT_H + output_padding_h)[:, None]
+              & (off_y_w < OUT_W + output_padding_w)[:, None]
+              & (off_y_k < KERNEL_N)[None, :])
+
+    tl.store(y_ptrs, acc, mask=mask_y)
+
+    return
 
 
 class _conv:
@@ -520,3 +1043,5 @@ class _conv:
             groups,
         )
 
+
+conv_forward = _conv.forward

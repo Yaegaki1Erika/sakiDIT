@@ -22,7 +22,7 @@ def get_should_calc(
         return accumulated_rel_l1_distance,True
     if cnt==0 or cnt ==29 or cnt==15 or cnt==2 or cnt==10 or cnt==20:
         return accumulated_rel_l1_distance,True
-    rescale_func = np.poly1d(coefficients_dict["CogVideoX-5b"])
+    rescale_func = np.poly1d(coefficients_dict["CogVideoX-2b"])
     accumulated_rel_l1_distance += rescale_func(((emb-previous_modulated_input).abs().mean() / previous_modulated_input.abs().mean()).cpu().item())
     # print(accumulated_rel_l1_distance)
     if accumulated_rel_l1_distance < rel_l1_thresh:

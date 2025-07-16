@@ -20,14 +20,8 @@ from .teacache import get_should_calc,enable_teacache
 accumulated_rel_l1_distance=0
 previous_modulated_input=None
 sort_attn=0
-attn_hidden_states_global=[None]*37
-attn_encoder_hidden_states_global=[None]*37
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
-
-import torch
-
-import torch
 
 def quantize_int4(tensor):
     orig_shape = tensor.shape
@@ -97,6 +91,8 @@ class BaseLayerNormZero(nn.Module):
     def forward(
             self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, temb: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # print(temb.device)
+        self.linear = self.linear.to(temb.device)
         shift, scale, gate, enc_shift, enc_scale, enc_gate = self.linear(self.silu(temb)).chunk(6, dim=1)
         hidden_states = self.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
         encoder_hidden_states = self.norm(encoder_hidden_states) * (1 + enc_scale)[:, None, :] + enc_shift[:, None, :]
@@ -153,7 +149,7 @@ class BasePatchEmbed(nn.Module):
         post_patch_width = sample_width // self.patch_size
         post_time_compression_frames = (sample_frames - 1) // self.temporal_compression_ratio + 1
         num_patches = post_patch_height * post_patch_width * post_time_compression_frames
-
+        device = torch.device('cuda:0')
         pos_embedding = get_3d_sincos_pos_embed(
             self.embed_dim,
             (post_patch_width, post_patch_height),
@@ -303,15 +299,12 @@ class BaseBlock(nn.Module):
         if enable_pab():
             broadcast_attn, _ = if_broadcast_spatial(int(timestep[0]), attn_count1)
         if enable_pab() and broadcast_attn and self.block_idx<37:
-            #print("saki!!!")
-            # attn_hidden_states = attn_hidden_states_global[self.block_idx]
-            # attn_encoder_hidden_states = attn_encoder_hidden_states_global[self.block_idx]
-            # attn_hidden_states_global[self.block_idx] = None
-            # attn_encoder_hidden_states_global[self.block_idx] = None
-            # attn_hidden_states, attn_encoder_hidden_states = self.last_attn
-            attn_hidden_states, attn_encoder_hidden_states = [
-            dequantize_tensor_dynamic(*item) for item in self.last_attn
-            ]
+            if self.block_idx<30:
+                attn_hidden_states, attn_encoder_hidden_states=self.last_attn
+            else:
+                attn_hidden_states, attn_encoder_hidden_states = [
+                    dequantize_tensor_dynamic(*item) for item in self.last_attn
+                ]
         else:
             attn_hidden_states, attn_encoder_hidden_states = self.attn1(
                 hidden_states=norm_hidden_states,
@@ -320,7 +313,10 @@ class BaseBlock(nn.Module):
                 **attention_kwargs,
             )
             if enable_pab() and self.block_idx<37:
-                self.last_attn = tuple(quantize_tensor_dynamic(t) for t in (attn_hidden_states, attn_encoder_hidden_states))
+                if self.block_idx<30:
+                    self.last_attn = (attn_hidden_states, attn_encoder_hidden_states)
+                else:
+                    self.last_attn = tuple(quantize_tensor_dynamic(t) for t in (attn_hidden_states, attn_encoder_hidden_states))
                 # self.last_attn = (attn_hidden_states, attn_encoder_hidden_states)
                 # attn_hidden_states_global[self.block_idx] = attn_hidden_states
                 # attn_encoder_hidden_states_global[self.block_idx] = attn_encoder_hidden_states
@@ -344,20 +340,19 @@ class BaseBlock(nn.Module):
         if enable_pab():
             broadcast_mlp, _ = if_broadcast_mlp_test(int(timestep[0]), mlp_count1)
         if enable_pab() and broadcast_mlp and 1<self.block_idx<28:
-            if 8<self.block_idx<8:
-                ff_output = dequantize_int4(*self.mlp)
-            elif 1<self.block_idx<28:
-                ff_output = dequantize_tensor_dynamic(*self.mlp)            
+            if self.block_idx<28:
+                ff_output = self.mlp
+            else:
+                ff_output = dequantize_tensor_dynamic(*self.mlp)     
         else:
 
             # feed-forward
             norm_hidden_states = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1)
             ff_output = self.ff(norm_hidden_states)
-            if enable_pab():
-                if 8<self.block_idx<8:
-                    qt_packed, scale, shape = quantize_int4(ff_output)
-                    self.mlp = (qt_packed, scale, shape)
-                elif 1<self.block_idx<28:
+            if enable_pab() and 1<self.block_idx<28:
+                if self.block_idx<28:
+                    self.mlp = ff_output
+                else:
                     self.mlp = quantize_tensor_dynamic(ff_output)
 
 
@@ -546,6 +541,7 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         # timesteps does not contain any weights and will always return f32 tensors
         # but time_embedding might actually be running in fp16. so we need to cast here.
         # there might be better ways to encapsulate this.
+        self.time_embedding = self.time_embedding.to(t_emb.device)
         t_emb = t_emb.to(dtype=hidden_states.dtype)
         emb = self.time_embedding(t_emb, timestep_cond)
 
@@ -622,7 +618,12 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             if enable_teacache and should_calc:
                 cache["previous_residual"] = hidden_states - ori_hidden_states
                 cache["previous_residual_encoder"] = encoder_hidden_states - ori_encoder_hidden_states
-
+        if cnt==29:
+            for i, block in enumerate(self.transformer_blocks):
+                block = self.transformer_blocks[i]
+                block.last_attn=None
+                block.mlp=None
+            previous_modulated_input=None
         hidden_states = self.norm_final(hidden_states)
 
         # 4. Final block

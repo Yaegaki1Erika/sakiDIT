@@ -31,7 +31,6 @@ class BaseDownsample3D(nn.Module):
         compress_time: bool = False,
     ):
         super().__init__()
-        print("in_channels is",in_channels)
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
         # conv_forward(input, weight, bias, stride, padding,
         #                               dilation, transposed, output_padding,
@@ -77,6 +76,7 @@ class BaseUpsample3D(nn.Module):
         super().__init__()
 
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
+        # self.conv = TritonConv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
         self.compress_time = compress_time
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
