@@ -13,7 +13,7 @@ from model.pipeline import BaseImageToVideoPipeline
 from model.scheduler import BaseDPMScheduler
 from model.transformer import BaseTransformer3DModel
 from model.vae import AutoencoderKLBase
-import torch_tensorrt
+# import torch_tensorrt
 # from model.qLinearLayer import replace_linear_skeleton
 # from torchao.quantization import autoquant
 # torch.cuda.set_per_process_memory_fraction(40 / 96, device=0)
@@ -144,9 +144,7 @@ def i2v():
         torch_dtype=dtype,
         subfolder="vae",
     )
-    vae = torch_tensorrt.ts.convert(vae)
     vae.eval()
-    vae.save("vae_trt.pt")
     # vae = torch.compile(vae, mode="reduce-overhead", fullgraph=False)
     # vae=torch.compile(vae)
 

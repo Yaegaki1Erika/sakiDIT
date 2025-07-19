@@ -42,8 +42,8 @@ def compute_similarity(feat1, feat2):
 
 # 主函数
 if __name__ == "__main__":
-    video1_path = "./gtt/1.mp4"  # 替换成你的视频路径
-    video2_path = "./output_3s/1.mp4"
+    video1_path = "./gtt/5.mp4"  # 替换成你的视频路径
+    video2_path = "./output_3s/5.mp4"
 
     print("Extracting features for Video 1...")
     feat1 = extract_clip_video_feature(video1_path)

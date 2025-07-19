@@ -92,8 +92,17 @@ class BaseLayerNormZero(nn.Module):
             self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, temb: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # print(temb.device)
-        self.linear = self.linear.to(temb.device)
+        device = torch.device('cuda:0')
+        temb=temb.to(device)
+        # self.linear = self.linear.to(device)
+        # shift = shift.to(device)
+        # scale = scale.to(device)
+        # gate = gate.to(device)
+        # enc_shift = enc_shift.to(device)
+        # enc_scale = enc_scale.to(device)
+        # enc_gate = enc_gate.to(device)
         shift, scale, gate, enc_shift, enc_scale, enc_gate = self.linear(self.silu(temb)).chunk(6, dim=1)
+        hidden_states=hidden_states.to(device)
         hidden_states = self.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
         encoder_hidden_states = self.norm(encoder_hidden_states) * (1 + enc_scale)[:, None, :] + enc_shift[:, None, :]
         return hidden_states, encoder_hidden_states, gate[:, None, :], enc_gate[:, None, :]
@@ -299,7 +308,7 @@ class BaseBlock(nn.Module):
         if enable_pab():
             broadcast_attn, _ = if_broadcast_spatial(int(timestep[0]), attn_count1)
         if enable_pab() and broadcast_attn and self.block_idx<37:
-            if self.block_idx<30:
+            if self.block_idx<20:
                 attn_hidden_states, attn_encoder_hidden_states=self.last_attn
             else:
                 attn_hidden_states, attn_encoder_hidden_states = [
@@ -313,7 +322,7 @@ class BaseBlock(nn.Module):
                 **attention_kwargs,
             )
             if enable_pab() and self.block_idx<37:
-                if self.block_idx<30:
+                if self.block_idx<20:
                     self.last_attn = (attn_hidden_states, attn_encoder_hidden_states)
                 else:
                     self.last_attn = tuple(quantize_tensor_dynamic(t) for t in (attn_hidden_states, attn_encoder_hidden_states))
@@ -515,6 +524,9 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             cnt = 0,
 
     ):
+        # print("视频输入 shape:", hidden_states.shape)
+        # print(self.patch_embed)
+
         global accumulated_rel_l1_distance
         global previous_modulated_input
         if attention_kwargs is not None:
@@ -627,6 +639,8 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         hidden_states = self.norm_final(hidden_states)
 
         # 4. Final block
+        device = torch.device('cuda:0')
+        emb=emb.to(device)
         hidden_states = self.norm_out(hidden_states, temb=emb)
         hidden_states = self.proj_out(hidden_states)
 

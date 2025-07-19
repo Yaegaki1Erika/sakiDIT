@@ -1002,6 +1002,7 @@ class AutoencoderKLBase(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             start_frame = frame_batch_size * i + (0 if i == 0 else remaining_frames)
             end_frame = frame_batch_size * (i + 1) + remaining_frames
             x_intermediate = x[:, :, start_frame:end_frame]
+            print(x_intermediate.shape)
             x_intermediate, conv_cache = self.encoder(x_intermediate, conv_cache=conv_cache)
             if self.quant_conv is not None:
                 x_intermediate = self.quant_conv(x_intermediate)
