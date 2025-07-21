@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import PIL
 import torch
+import torch.nn.functional as F
 from transformers import T5EncoderModel, T5Tokenizer
 
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
@@ -17,6 +18,7 @@ from .scheduler import BaseDPMScheduler
 from .transformer import BaseTransformer3DModel
 from .pipeline_output import BasePipelineOutput
 from .vae import AutoencoderKLBase
+import cv2
 # import gc
 
 
@@ -29,6 +31,7 @@ latents_list=[]
 list_vedio=0
 list_vedio_total=0
 is_del_te=0
+vae_batch_size=4
 # latents_one=None
 # Similar to diffusers.pipelines.hunyuandit.pipeline_hunyuandit.get_resize_crop_region_for_grid
 def get_resize_crop_region_for_grid(src, tgt_width, tgt_height):
@@ -753,6 +756,7 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
         pose_video = pose_video.permute(0, 2, 1, 3, 4)
         device = torch.device('cuda:0')
         pose_video = pose_video.to(device, dtype=torch.float16)
+        # print(pose_video.shape)
         pose_latent_dist = self.vae.encode(pose_video).latent_dist
         pose_latent_dist = pose_latent_dist.sample(generator) * self.vae_scaling_factor_image
         pose_latent_dist = pose_latent_dist.permute(0, 2, 1, 3, 4).contiguous()
@@ -769,7 +773,7 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
     def decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
         latents = latents.permute(0, 2, 1, 3, 4)  # [batch_size, num_channels, num_frames, height, width]
         latents = 1 / self.vae_scaling_factor_image * latents
-
+        # print(latents.shape)
         frames = self.vae.decode(latents).sample
         return frames
 
@@ -1133,7 +1137,7 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
             for i, latent in enumerate(latents_list):
                 if latent is None:
                     print(f"[ERROR] latent at index {i} is None!")
-            if list_vedio==3 or list_vedio_total==total_vedio_num:
+            if list_vedio==vae_batch_size-1 or list_vedio_total==total_vedio_num:
                 
 
                 # for obj in gc.get_objects():
@@ -1176,8 +1180,18 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
                 processed_videos = []
                 for video in videos:  # 每个: [3, F, H, W]
                     video = video.unsqueeze(0)
+                    # print(video.shape)
+                    N, C, T, H, W = video.shape
+
+                    # 插值放大每一帧
+                    video = video.permute(0, 2, 1, 3, 4).reshape(-1, C, H, W)  # [T, 3, H, W]
+                    video = F.interpolate(video, size=(720, 1280), mode='bicubic', align_corners=False)
+                    video = video.reshape(N, T, C, 720, 1280).permute(0, 2, 1, 3, 4)  # [1, 3, T, 720, 1280]
+
                     result = self.video_processor.postprocess_video(video=video, output_type=output_type)
+
                     processed_videos.append(result)
+                    # processed_videos.append(result)
 
                 video = processed_videos  # List of 5 videos
                 # list_vedio = 0  # reset for next batch
@@ -1189,10 +1203,10 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
 
         if not return_dict:
             return (video,)
-        if list_vedio!=3 and list_vedio_total!=total_vedio_num:
+        if list_vedio!=vae_batch_size-1 and list_vedio_total!=total_vedio_num:
             video = latents
         list_vedio+=1
-        list_vedio=list_vedio%4
+        list_vedio=list_vedio%vae_batch_size
         return video
         # else:
         #     output

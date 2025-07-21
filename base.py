@@ -2,6 +2,7 @@ import cv2
 import math
 import sys
 import torch
+# import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from pathlib import Path
@@ -13,7 +14,6 @@ from model.pipeline import BaseImageToVideoPipeline
 from model.scheduler import BaseDPMScheduler
 from model.transformer import BaseTransformer3DModel
 from model.vae import AutoencoderKLBase
-# import torch_tensorrt
 # from model.qLinearLayer import replace_linear_skeleton
 # from torchao.quantization import autoquant
 # torch.cuda.set_per_process_memory_fraction(40 / 96, device=0)
@@ -91,9 +91,15 @@ def i2v():
     
 
     # h, w
-    image_size = (720, 1280)
-    base_height = 720
-    base_width = 1280
+    # image_size = (720, 1280)
+    # base_height = 720
+    # base_width = 1280
+    # image_size = (640, 1152)
+    # base_height = 640
+    # base_width = 1152
+    image_size = (432, 768)
+    base_height = 432
+    base_width = 768
     num_frames = 25
 
     negative_prompt = "Generate videos rife with blurry, indistinct visuals lacking clarity, where characters and objects exhibit exaggerated, mismatched proportions, leading to a chaotic spatial incoherence. Twist everyday interactions into disturbing spectacles, with an emphasis on the horrifying deformation of hands—fingers that are disgustingly elongated, shortened, or contorted into nightmarish configurations. These hands should look utterly alien, with joints bending in impossible ways to evoke a deep sense of horror and discomfort. The footage should include abrupt appearances and disappearances of elements, disrupting continuity. Transitions and movements should be jarring, compounded by shaky, unsteady camera work and unattractive compositions that fail to please aesthetically. Expect gross anatomical distortions with twisted bodies, hands, and faces, alongside strange, illogical interactions that defy spatial logic and physical reality, all culminating in a visually displeasing and disorienting viewing experience."
@@ -145,9 +151,8 @@ def i2v():
         subfolder="vae",
     )
     vae.eval()
-    # vae = torch.compile(vae, mode="reduce-overhead", fullgraph=False)
-    # vae=torch.compile(vae)
-
+    # vae.to(device)
+    # vae.encoder = torch.compile(vae.encoder)
     transformer = BaseTransformer3DModel.from_pretrained(
         model_dir.as_posix(),
         torch_dtype=dtype,

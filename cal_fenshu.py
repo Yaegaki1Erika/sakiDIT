@@ -1,3 +1,4 @@
+import os
 import torch
 import cv2
 import numpy as np
@@ -40,16 +41,43 @@ def compute_similarity(feat1, feat2):
     feat2 = F.normalize(feat2, dim=0)
     return torch.dot(feat1, feat2).item()
 
+# 提取视频特征
+def extract_features_from_directory(directory_path, video_names):
+    features = {}
+    for video_name in video_names:
+        video_path = os.path.join(directory_path, f"{video_name}.mp4")
+        print(f"Extracting features for {video_path}...")
+        feat = extract_clip_video_feature(video_path)
+        features[video_name] = feat
+    return features
+
 # 主函数
 if __name__ == "__main__":
-    video1_path = "./gtt/5.mp4"  # 替换成你的视频路径
-    video2_path = "./output_3s/5.mp4"
+    gtt_dir = "./gtt"  # gtt 目录路径
+    output_3s_dir = "./output_3s"  # output_3s 目录路径
 
-    print("Extracting features for Video 1...")
-    feat1 = extract_clip_video_feature(video1_path)
+    # 视频文件名列表（假设两个目录的文件名相同）
+    video_names = ["1", "2", "3", "4", "5"]
 
-    print("Extracting features for Video 2...")
-    feat2 = extract_clip_video_feature(video2_path)
+    # 提取每个视频的特征
+    print("Extracting features for gtt videos...")
+    gtt_features = extract_features_from_directory(gtt_dir, video_names)
 
-    score = compute_similarity(feat1, feat2)
-    print(f"\n🎯 Cosine similarity between the two videos: {score:.4f}")
+    print("Extracting features for output_3s videos...")
+    output_3s_features = extract_features_from_directory(output_3s_dir, video_names)
+    scores = []
+    # 计算每一对视频的相似度
+    for video_name in video_names:
+        feat1 = gtt_features[video_name]
+        feat2 = output_3s_features[video_name]
+        score = compute_similarity(feat1, feat2)
+        scores.append(score)
+        print(f"\n🎯 Cosine similarity between {video_name} from gtt and output_3s: {score:.4f}")
+    if scores:
+        avg_score = sum(scores) / len(scores)
+        print(f"\n📊 Average cosine similarity over {len(scores)} videos: {avg_score:.4f}")
+    # 计算两个集合的平均特征相似度
+    feat1_avg = torch.stack(list(gtt_features.values())).mean(dim=0)
+    feat2_avg = torch.stack(list(output_3s_features.values())).mean(dim=0)
+    score = compute_similarity(feat1_avg, feat2_avg)
+    print(f"\n🎯 Cosine similarity between the average features of the two video sets: {score:.4f}")

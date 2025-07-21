@@ -308,7 +308,7 @@ class BaseBlock(nn.Module):
         if enable_pab():
             broadcast_attn, _ = if_broadcast_spatial(int(timestep[0]), attn_count1)
         if enable_pab() and broadcast_attn and self.block_idx<37:
-            if self.block_idx<20:
+            if self.block_idx<32:
                 attn_hidden_states, attn_encoder_hidden_states=self.last_attn
             else:
                 attn_hidden_states, attn_encoder_hidden_states = [
@@ -322,7 +322,7 @@ class BaseBlock(nn.Module):
                 **attention_kwargs,
             )
             if enable_pab() and self.block_idx<37:
-                if self.block_idx<20:
+                if self.block_idx<32:
                     self.last_attn = (attn_hidden_states, attn_encoder_hidden_states)
                 else:
                     self.last_attn = tuple(quantize_tensor_dynamic(t) for t in (attn_hidden_states, attn_encoder_hidden_states))
