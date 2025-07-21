@@ -19,6 +19,7 @@ from .transformer import BaseTransformer3DModel
 from .pipeline_output import BasePipelineOutput
 from .vae import AutoencoderKLBase
 import cv2
+from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 # import gc
 
 
@@ -602,6 +603,7 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
             transformer=transformer,
             scheduler=scheduler,
         )
+        self.vae_encoder = torch.export.load("vae.ep").module()
         self.vae_scale_factor_spatial = (
             2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         )
@@ -757,7 +759,7 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
         device = torch.device('cuda:0')
         pose_video = pose_video.to(device, dtype=torch.float16)
         # print(pose_video.shape)
-        pose_latent_dist = self.vae.encode(pose_video).latent_dist
+        pose_latent_dist = DiagonalGaussianDistribution(self.vae_encoder(pose_video))
         pose_latent_dist = pose_latent_dist.sample(generator) * self.vae_scaling_factor_image
         pose_latent_dist = pose_latent_dist.permute(0, 2, 1, 3, 4).contiguous()
 

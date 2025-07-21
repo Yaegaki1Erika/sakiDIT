@@ -151,8 +151,12 @@ def i2v():
         subfolder="vae",
     )
     vae.eval()
-    # vae.to(device)
-    # vae.encoder = torch.compile(vae.encoder)
+    # vae.to(dtype=dtype, device=device)
+    # inputs = torch_tensorrt.Input(shape=[1, 3, 25, 432, 768], dtype=torch.half)
+    # vae_gm = torch_tensorrt.compile(vae, inputs=[inputs], ir="dynamo")
+    
+    # torch_tensorrt.save(vae_gm, "vae.ep")
+
     transformer = BaseTransformer3DModel.from_pretrained(
         model_dir.as_posix(),
         torch_dtype=dtype,

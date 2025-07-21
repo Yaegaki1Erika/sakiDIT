@@ -1026,6 +1026,14 @@ class AutoencoderKLBase(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         if not return_dict:
             return (posterior,)
         return AutoencoderKLOutput(latent_dist=posterior)
+    
+    def mini_encode(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_slicing and x.shape[0] > 1:
+            encoded_slices = [self._encode(x_slice) for x_slice in x.split(1)]
+            h = torch.cat(encoded_slices)
+        else:
+            h = self._encode(x)
+        return h
 
     def _decode(self, z: torch.Tensor, return_dict: bool = True) -> Union[DecoderOutput, torch.Tensor]:
         batch_size, num_channels, num_frames, height, width = z.shape
@@ -1193,18 +1201,6 @@ class AutoencoderKLBase(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
     def forward(
         self,
-        sample: torch.Tensor,
-        sample_posterior: bool = False,
-        return_dict: bool = True,
-        generator: Optional[torch.Generator] = None,
-    ) -> Union[torch.Tensor, torch.Tensor]:
-        x = sample
-        posterior = self.encode(x).latent_dist
-        if sample_posterior:
-            z = posterior.sample(generator=generator)
-        else:
-            z = posterior.mode()
-        dec = self.decode(z).sample
-        if not return_dict:
-            return (dec,)
-        return DecoderOutput(sample=dec)
+        x: torch.Tensor
+    ) -> torch.Tensor:
+        return self.mini_encode(x)
