@@ -291,7 +291,7 @@ class BaseBlock(nn.Module):
             image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
             timestep=None,
             attention_kwargs: Optional[Dict[str, Any]] = None,
-            attn_count1: int = 0,
+            attn_count1: int = 0, # 表示当前是第几个 timestep
             mlp_count1: int = 0,
     ) -> torch.Tensor:
         # print(self.block_idx)
@@ -305,10 +305,14 @@ class BaseBlock(nn.Module):
         )
         #print(enable_pab())
         #print("saki!!")
+        broadcast_attn = False
         if enable_pab():
+            # 现在这个判断，对于每一个 block，只有第一个 timestep 为 false
+            # 所以只有第一个 timestep 会计算每个 block 的 attention
+            # 后续 timestep 的 block 的 attn 都是直接用同一个 block 前一个 timestep 的结果
             broadcast_attn, _ = if_broadcast_spatial(int(timestep[0]), attn_count1)
-        if enable_pab() and broadcast_attn and self.block_idx<37:
-            if self.block_idx<32:
+        if enable_pab() and broadcast_attn and self.block_idx <= 36:  # 原版 36
+            if self.block_idx <= 36: # 原版 31
                 attn_hidden_states, attn_encoder_hidden_states=self.last_attn
             else:
                 attn_hidden_states, attn_encoder_hidden_states = [
@@ -321,8 +325,8 @@ class BaseBlock(nn.Module):
                 image_rotary_emb=image_rotary_emb,
                 **attention_kwargs,
             )
-            if enable_pab() and self.block_idx<37:
-                if self.block_idx<32:
+            if enable_pab() and self.block_idx <= 36: # 原版 36
+                if self.block_idx <= 36: # 原版 31
                     self.last_attn = (attn_hidden_states, attn_encoder_hidden_states)
                 else:
                     self.last_attn = tuple(quantize_tensor_dynamic(t) for t in (attn_hidden_states, attn_encoder_hidden_states))
@@ -348,8 +352,8 @@ class BaseBlock(nn.Module):
 
         if enable_pab():
             broadcast_mlp, _ = if_broadcast_mlp_test(int(timestep[0]), mlp_count1)
-        if enable_pab() and broadcast_mlp and 1<self.block_idx<28:
-            if self.block_idx<28:
+        if enable_pab() and broadcast_mlp and 2 <= self.block_idx <= 27:
+            if self.block_idx <= 27:
                 ff_output = self.mlp
             else:
                 ff_output = dequantize_tensor_dynamic(*self.mlp)     
@@ -358,8 +362,8 @@ class BaseBlock(nn.Module):
             # feed-forward
             norm_hidden_states = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1)
             ff_output = self.ff(norm_hidden_states)
-            if enable_pab() and 1<self.block_idx<28:
-                if self.block_idx<28:
+            if enable_pab() and 2 <= self.block_idx <= 27:
+                if self.block_idx <= 27:
                     self.mlp = ff_output
                 else:
                     self.mlp = quantize_tensor_dynamic(ff_output)
@@ -408,7 +412,6 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
     ):
         super().__init__()
         inner_dim = num_attention_heads * attention_head_dim
-
         # 1. Patch embedding
         self.patch_embed = BasePatchEmbed(
             patch_size=patch_size,
@@ -507,7 +510,11 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         for name, module in self.named_children():
             fn_recursive_attn_processor(name, module, processor)
 
-
+    # 每个 timestep 会调用一次此 forward，此 forward 中会调用 42 个 block 的 forward
+    # teacache 会尝试跳过整个 42 个 block 的 forward，直至一个累计偏差过大，才会在某次 timestep 重新计算
+    # 在 teacache 没有跳过 42 个 block 的情况下，
+    # Δcache 会记录部分 block 计算前后的 Δ，在下一个 timestep 时应用
+    # 当 delta_cache_flag 为 1 时，需要计算各个 block，此时应注意不能让 teacache 跳过当前 timestep
     def forward(
             self,
             hidden_states: torch.Tensor,
@@ -587,6 +594,8 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             if enable_teacache and should_calc:
                 ori_hidden_states=hidden_states
                 ori_encoder_hidden_states=encoder_hidden_states
+            # print(f'teacache ask calculate at step {cnt}')
+            # print(f'delta_cache_flag is {delta_cache_flag}, start from {delta_cache_start}, end with {delta_cache_end}')
             # 3. Transformer blocks
             for i, block in enumerate(self.transformer_blocks):
                 block = self.transformer_blocks[i]
@@ -594,11 +603,10 @@ class BaseTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 if i == delta_cache_start and delta_cache_flag == 1:
                     hidden_states_before = hidden_states
                     encoder_hidden_states_before = encoder_hidden_states
-                    
+                
                 if i == delta_cache_start and delta_cache_flag == 2:
                     hidden_states += cache["hidden_states"]
                     encoder_hidden_states += cache["encoder_hidden_states"]
-                    i = delta_cache_end + 1
                     break
 
                 if torch.is_grad_enabled() and self.gradient_checkpointing:

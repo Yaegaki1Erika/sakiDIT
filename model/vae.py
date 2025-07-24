@@ -13,6 +13,7 @@ from diffusers.models.activations import get_activation
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDistribution
+# import torch_tensorrt
 
 # import math
 # from .conv import conv_forward
@@ -873,7 +874,7 @@ class BaseDecoder3D(nn.Module):
         hidden_states = self.conv_act(hidden_states)
         hidden_states, new_conv_cache["conv_out"] = self.conv_out(hidden_states, conv_cache=conv_cache.get("conv_out"))
 
-        return hidden_states, new_conv_cache
+        return hidden_states, new_conv_cache        
 
 
 class AutoencoderKLBase(ModelMixin, ConfigMixin, FromOriginalModelMixin):
@@ -1015,6 +1016,7 @@ class AutoencoderKLBase(ModelMixin, ConfigMixin, FromOriginalModelMixin):
     def encode(
         self, x: torch.Tensor, return_dict: bool = True
     ) -> Union[AutoencoderKLOutput, Tuple[DiagonalGaussianDistribution]]:
+        # print(f'Encoding {x.shape}')
         if self.use_slicing and x.shape[0] > 1:
             encoded_slices = [self._encode(x_slice) for x_slice in x.split(1)]
             h = torch.cat(encoded_slices)
@@ -1198,7 +1200,7 @@ class AutoencoderKLBase(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             return (dec,)
 
         return DecoderOutput(sample=dec)
-
+    
     def forward(
         self,
         x: torch.Tensor

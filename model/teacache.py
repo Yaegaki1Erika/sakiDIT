@@ -1,7 +1,7 @@
 import numpy as np
 
-enable_teacache=False
-rel_l1_thresh=0.05
+enable_teacache=True
+rel_l1_thresh=0.066
 coefficients_dict = {
     "CogVideoX-2b":[-3.10658903e+01,  2.54732368e+01, -5.92380459e+00,  1.75769064e+00, -3.61568434e-03],
     "CogVideoX-5b":[-1.53880483e+03,  8.43202495e+02, -1.34363087e+02,  7.97131516e+00, -5.23162339e-02],
@@ -24,7 +24,7 @@ def get_should_calc(
         return accumulated_rel_l1_distance,True
     rescale_func = np.poly1d(coefficients_dict["CogVideoX-2b"])
     accumulated_rel_l1_distance += rescale_func(((emb-previous_modulated_input).abs().mean() / previous_modulated_input.abs().mean()).cpu().item())
-    # print(accumulated_rel_l1_distance)
+    # print(f'accumulated_rel_l1_distance :{accumulated_rel_l1_distance:.4f}')
     if accumulated_rel_l1_distance < rel_l1_thresh:
         should_calc = False
     else:

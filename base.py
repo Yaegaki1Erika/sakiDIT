@@ -2,6 +2,8 @@ import cv2
 import math
 import sys
 import torch
+import PIL
+import threading
 # import torch.nn.functional as F
 import numpy as np
 from PIL import Image
@@ -14,10 +16,11 @@ from model.pipeline import BaseImageToVideoPipeline
 from model.scheduler import BaseDPMScheduler
 from model.transformer import BaseTransformer3DModel
 from model.vae import AutoencoderKLBase
+# import torch_tensorrt
 # from model.qLinearLayer import replace_linear_skeleton
 # from torchao.quantization import autoquant
 # torch.cuda.set_per_process_memory_fraction(40 / 96, device=0)
-# import time
+import time
 total_vedio_num=0
 vae_batch_size=4
 def load_video(video_path: str, new_fps: int = 8):
@@ -77,6 +80,36 @@ def resize_and_crop_video(video, target_size):
 
     return resized_frames
 
+def analyze_image_colors(image):
+    np_img = np.array(image)  # shape: (H, W, 3)
+    mean_rgb = np_img.mean(axis=(0, 1))  # R, G, B 均值
+    # print(f"Mean R: {mean_rgb[0]:.2f}, G: {mean_rgb[1]:.2f}, B: {mean_rgb[2]:.2f}")
+    return mean_rgb
+
+def color_revert_toward_reference(output_images, target_mean_rgb, strength=0.1):
+    """
+    使 output_image 的色彩均值向 target_mean_rgb 靠拢
+
+    参数:
+        output_image: PIL.Image，当前帧的输出图像
+        target_mean_rgb: tuple(float, float, float)，目标输入图的均值
+        strength: float, 0.0~1.0，校正强度，1.0 为完全对齐
+
+    返回:
+        corrected_image: PIL.Image
+    """
+    ret = []
+    for output_image in output_images:
+        output_np = np.array(output_image).astype(np.float32)
+        current_mean = output_np.mean(axis=(0, 1))  # shape=(3,)
+        diff = np.array(target_mean_rgb) - current_mean  # 目标 - 当前 → 应该调整多少
+        correction = diff * strength  # 控制校正强度
+
+        # 应用补偿
+        corrected = output_np + correction.reshape(1, 1, 3)
+        corrected = np.clip(corrected, 0, 255).astype(np.uint8)
+        ret.append(PIL.Image.fromarray(corrected))
+    return ret
 
 @torch.inference_mode()
 def i2v():
@@ -87,29 +120,34 @@ def i2v():
     output_dir = Path(sys.argv[3])
     model_dir = Path(sys.argv[4])
 
-    # 
-    
-
     # h, w
-    # image_size = (720, 1280)
+    # image_size = (720, 1280)  # 最终目标要求
     # base_height = 720
     # base_width = 1280
-    # image_size = (640, 1152)
-    # base_height = 640
-    # base_width = 1152
-    image_size = (432, 768)
-    base_height = 432
-    base_width = 768
+    # image_size = (512, 896) # 因为 noise 和 latents 规格不同所以没法用，应该还是整除的问题
+    # base_height = 512
+    # base_width = 896
+    image_size = (576, 1024)
+    base_height = image_size[0]
+    base_width = image_size[1]
+    # image_size = (432, 768)  # 原版
+    # base_height = 432
+    # base_width = 768
     num_frames = 25
 
     negative_prompt = "Generate videos rife with blurry, indistinct visuals lacking clarity, where characters and objects exhibit exaggerated, mismatched proportions, leading to a chaotic spatial incoherence. Twist everyday interactions into disturbing spectacles, with an emphasis on the horrifying deformation of hands—fingers that are disgustingly elongated, shortened, or contorted into nightmarish configurations. These hands should look utterly alien, with joints bending in impossible ways to evoke a deep sense of horror and discomfort. The footage should include abrupt appearances and disappearances of elements, disrupting continuity. Transitions and movements should be jarring, compounded by shaky, unsteady camera work and unattractive compositions that fail to please aesthetically. Expect gross anatomical distortions with twisted bodies, hands, and faces, alongside strange, illogical interactions that defy spatial logic and physical reality, all culminating in a visually displeasing and disorienting viewing experience."
 
     data = []
+    origin_rgbs = {}
+    origin_images = {}
     for p in video_input_dir.glob('*.mp4'):
         ipath = image_input_dir / (p.stem + '.jpg')
         video = load_video(p.as_posix())
         image = load_image(ipath.as_posix())
-
+        
+        origin_rgbs[p.stem] = analyze_image_colors(image)
+        origin_images[p.stem] = resize_and_crop_image(image, (720, 1280))
+        
         resized_frames = resize_and_crop_video(video, image_size)
         video_array_init = np.stack(resized_frames, axis=0)[:num_frames]
         video_array = video_array_init.transpose(0, 3, 1, 2)
@@ -131,7 +169,7 @@ def i2v():
     device = torch.device('cuda:0')
     dtype = torch.float16
     generator = torch.Generator(device=device).manual_seed(42)
-
+    
     tokenizer = T5Tokenizer.from_pretrained(
         model_dir.as_posix(),
         trust_remote_code=True,
@@ -151,12 +189,12 @@ def i2v():
         subfolder="vae",
     )
     vae.eval()
+    
     # vae.to(dtype=dtype, device=device)
     # inputs = torch_tensorrt.Input(shape=[1, 3, 25, 432, 768], dtype=torch.half)
     # vae_gm = torch_tensorrt.compile(vae, inputs=[inputs], ir="dynamo")
-    
     # torch_tensorrt.save(vae_gm, "vae.ep")
-
+    
     transformer = BaseTransformer3DModel.from_pretrained(
         model_dir.as_posix(),
         torch_dtype=dtype,
@@ -183,7 +221,6 @@ def i2v():
     # assert not missing and not unexpected, f"state_dict mismatch: {missing=}, {unexpected=}"
 
     # transformer.to("cuda").eval()
-
     scheduler = BaseDPMScheduler(
         clip_sample=False,
         prediction_type='v_prediction',
@@ -247,6 +284,9 @@ def i2v():
                 # print("saki!!!")
                 stem_now=stem_batch[tmp_stem]
                 tmp_stem+=1
+                # video[0] = color_revert_toward_reference(video[0], origin_rgbs[stem_now])
+                # video[0][0] = origin_images[stem_now]
+                
                 export_to_video(video[0], (output_dir / f'{stem_now}.mp4').as_posix(), fps=8)
         # export_to_video(video, (output_dir / f'{stem}.mp4').as_posix(), fps=8)
         # if 1 <= i <= 4:

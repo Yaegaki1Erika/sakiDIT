@@ -19,9 +19,60 @@ from .transformer import BaseTransformer3DModel
 from .pipeline_output import BasePipelineOutput
 from .vae import AutoencoderKLBase
 import cv2
+import numpy as np
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 # import gc
 
+def resize_video_opencv(video: torch.Tensor, size=(720, 1280), interpolation=cv2.INTER_LANCZOS4):
+    """
+    使用 OpenCV 对视频逐帧进行插值放大
+    输入:
+        video: [N, C, T, H, W] (float32, 0~1 或 uint8)
+        size: (H_out, W_out)
+    输出:
+        resized: [N, C, T, H_out, W_out]
+    """
+    N, C, T, H, W = video.shape
+    assert C == 3, "只支持 RGB 视频"
+
+    resized_frames = []
+
+    for n in range(N):
+        clip = []
+        for t in range(T):
+            frame = video[n, :, t]  # [3, H, W]
+            frame_np = frame.permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
+            # frame_np = (frame_np * 255).astype(np.uint8) if frame_np.dtype != np.uint8 else frame_np
+
+            resized_np = cv2.resize(frame_np, (size[1], size[0]), interpolation=interpolation)  # (W, H)
+            # resized_tensor = torch.from_numpy(resized_np).permute(2, 0, 1).float() / 255.0  # [3, H, W]
+            resized_tensor = torch.from_numpy(resized_np).permute(2, 0, 1)  # [3, H, W]
+            clip.append(resized_tensor)
+        resized_frames.append(torch.stack(clip, dim=1))  # [3, T, H, W]
+
+    return torch.stack(resized_frames, dim=0)  # [N, C, T, H, W]
+
+def resize_frames_pil(frames, size=(1280, 720), resample=PIL.Image.LANCZOS):
+    """
+    参数:
+      frames: List[PIL.Image.Image]
+      size: (W, H)
+    返回:
+      resized_frames: List[PIL.Image.Image]
+    """
+    return [frame.resize(size, resample=resample) for frame in frames]
+
+def sharp_frames_pil(frames, sharpeness=2.0):
+    return [PIL.ImageEnhance.Sharpness(f).enhance(sharpeness) for f in frames]
+
+def bright_frames_pil(frames, brightness=1.1):
+    return [PIL.ImageEnhance.Brightness(f).enhance(brightness) for f in frames]
+
+def contrast_frames_pil(frames, contrast=0.8):
+    return [PIL.ImageEnhance.Contrast(f).enhance(contrast) for f in frames]
+
+def color_frames_pil(frames, color=0.8):
+    return [PIL.ImageEnhance.Color(f).enhance(color) for f in frames]
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -603,9 +654,9 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
             transformer=transformer,
             scheduler=scheduler,
         )
-        self.vae_encoder = torch.export.load("vae.ep").module()
+        # self.vae_encoder = torch.export.load("vae.ep").module()
         self.vae_scale_factor_spatial = (
-            2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
+            2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 4
         )
         self.vae_scale_factor_temporal = (
             self.vae.config.temporal_compression_ratio if getattr(self, "vae", None) else 4
@@ -759,7 +810,8 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
         device = torch.device('cuda:0')
         pose_video = pose_video.to(device, dtype=torch.float16)
         # print(pose_video.shape)
-        pose_latent_dist = DiagonalGaussianDistribution(self.vae_encoder(pose_video))
+        pose_latent_dist = self.vae.encode(pose_video).latent_dist
+        # pose_latent_dist = DiagonalGaussianDistribution(self.vae_encoder(pose_video))
         pose_latent_dist = pose_latent_dist.sample(generator) * self.vae_scaling_factor_image
         pose_latent_dist = pose_latent_dist.permute(0, 2, 1, 3, 4).contiguous()
 
@@ -1046,7 +1098,7 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
             # for DPM-solver++
             old_pred_original_sample = None
             cache = {}
-            for i, t in enumerate(timesteps):
+            for i, t in enumerate(timesteps):  # timesteps = tensor([999, 966, 932, 899, ...(30个)], device='cuda:0')
                 if self.interrupt:
                     continue
 
@@ -1075,8 +1127,8 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
                     delta_cache_flag=delta_cache_flag,
-                    delta_cache_start=28,
-                    delta_cache_end=36,
+                    delta_cache_start=28, # 28
+                    delta_cache_end=36,   # 36
                     cache=cache,
                     cnt=i,
                 )[0]
@@ -1182,18 +1234,28 @@ class BaseImageToVideoPipeline(DiffusionPipeline):
                 processed_videos = []
                 for video in videos:  # 每个: [3, F, H, W]
                     video = video.unsqueeze(0)
-                    # print(video.shape)
-                    N, C, T, H, W = video.shape
+                    # video = video[:, :, :, :504, :]
+                    # N, C, T, H, W = video.shape
 
                     # 插值放大每一帧
-                    video = video.permute(0, 2, 1, 3, 4).reshape(-1, C, H, W)  # [T, 3, H, W]
-                    video = F.interpolate(video, size=(720, 1280), mode='bicubic', align_corners=False)
-                    video = video.reshape(N, T, C, 720, 1280).permute(0, 2, 1, 3, 4)  # [1, 3, T, 720, 1280]
-
+                    # video = video.permute(0, 2, 1, 3, 4).reshape(-1, C, H, W)  # [T, 3, H, W]
+                    # video = F.interpolate(video, size=(720, 1280), mode='bicubic', align_corners=True, antialias=True)
+                    # video = video.reshape(N, T, C, 720, 1280).permute(0, 2, 1, 3, 4)  # [1, 3, T, 720, 1280]
+                    
+                    # 使用 opencv 插值
+                    # video = resize_video_opencv(video)
+                    
                     result = self.video_processor.postprocess_video(video=video, output_type=output_type)
+                    
+                    # 使用 PIL 插值
+                    result[0] = resize_frames_pil(result[0])
+                    
+                    # result[0] = sharp_frames_pil(result[0])
+                    result[0] = bright_frames_pil(result[0])
+                    # result[0] = contrast_frames_pil(result[0]) # 停用
+                    result[0] = color_frames_pil(result[0])
 
                     processed_videos.append(result)
-                    # processed_videos.append(result)
 
                 video = processed_videos  # List of 5 videos
                 # list_vedio = 0  # reset for next batch
